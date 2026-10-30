@@ -2,7 +2,7 @@
 
 A household assistant that turns what it remembers about each person into Qloo signals, ranks one shortlist for each of them, and picks the option nobody ranks low.
 
-**Live demo:** https://agora-plus-295478535981.us-central1.run.app (household passcode: tastecouncil — a fictional family is preloaded)
+**Live demo:** https://agora-plus-295478535981.us-central1.run.app — tap **Enter the demo** on the lock screen (passcode `tastecouncil` is shown there). A fictional family is preloaded.
 
 Submitted to the Qloo Agentic Hackathon ("Agents, but with taste"). Source code is MIT ([LICENSE](LICENSE)). The deep dive is [docs/QLOO.md](docs/QLOO.md). Copy-ready submission text is [docs/SUBMISSION_QLOO.md](docs/SUBMISSION_QLOO.md).
 
