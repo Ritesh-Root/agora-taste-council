@@ -291,8 +291,8 @@ You need Node.js 22.19 or newer (the harness's minimum), npm, git, and a Qloo ha
 2. Get the code and install.
 
    ```bash
-   git clone https://github.com/Ritesh-Root/agora-plus.git
-   cd agora-plus
+   git clone https://github.com/Ritesh-Root/agora-taste-council.git
+   cd agora-taste-council
    npm ci
    cp .env.example .env
    ```

@@ -127,7 +127,7 @@ Full setup from a clean machine, environment variables, and the Cloud Run comman
 npm install --global @qloo/qloo-harness@0.1.26
 qloo setup --qloo                                        # paste the key; it is hidden
 qloo config set base-url https://hackathon.api.qloo.com
-git clone https://github.com/Ritesh-Root/agora-plus.git && cd agora-plus
+git clone https://github.com/Ritesh-Root/agora-taste-council.git && cd agora-taste-council
 npm ci
 AGORA_DEMO_SEED=1 AGORA_TASTE_LOCATION=Bengaluru npm run dev
 ```
@@ -199,8 +199,8 @@ A `forget` request sent over MCP comes back as `needs_approval` and waits on the
 You need Node.js and npm. The [Dockerfile](Dockerfile) uses Node 22. Qloo's harness asks for Node 22.19.0 or newer. The repository does not declare an engines field.
 
 ```bash
-git clone https://github.com/Ritesh-Root/agora-plus.git
-cd agora-plus
+git clone https://github.com/Ritesh-Root/agora-taste-council.git
+cd agora-taste-council
 npm ci
 cp .env.example .env
 ```
@@ -486,4 +486,4 @@ Third-party code and assets have their own notices. Those notices stay in the fi
 
 Maintainer: Ritesh-Root &lt;workstationritalks@gmail.com&gt; · https://github.com/Ritesh-Root
 
-Repository: https://github.com/Ritesh-Root/agora-plus · built on AGORA, https://github.com/Ritesh-Root/agora
+Repository: https://github.com/Ritesh-Root/agora-taste-council (forked from https://github.com/Ritesh-Root/agora-plus) · built on AGORA, https://github.com/Ritesh-Root/agora

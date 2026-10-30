@@ -4,7 +4,7 @@ Copy-ready text for the "Agents, but with taste" entry. Every claim here matches
 
 **Live demo:** https://agora-plus-295478535981.us-central1.run.app (household passcode: tastecouncil — a fictional family is preloaded)
 
-**Repository:** https://github.com/Ritesh-Root/agora-plus (MIT licence, [LICENSE](../LICENSE))
+**Repository:** https://github.com/Ritesh-Root/agora-taste-council (MIT licence, [LICENSE](../LICENSE))
 
 ## Project name
 
