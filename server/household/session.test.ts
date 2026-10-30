@@ -4,7 +4,7 @@ import { mkdtemp, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { recordPasscodeMiss, resetPasscodeLimiter, setPasscodeClock, verifySessionToken } from './session';
+import { demoPasscode, recordPasscodeMiss, resetPasscodeLimiter, setPasscodeClock, verifySessionToken } from './session';
 import { setDataDir, writeText } from './store';
 import { handleApiRoutes } from '../routes';
 
@@ -21,6 +21,7 @@ beforeEach(async () => {
   remember('AGORA_HOUSEHOLD_PASSCODE');
   remember('AGORA_TOKEN_SECRET');
   remember('AGORA_TRUST_PROXY');
+  remember('AGORA_DEMO_PUBLIC_PASSCODE');
   process.env.AGORA_HOUSEHOLD_PASSCODE = 'home-pass';
   process.env.AGORA_TOKEN_SECRET = 'session-secret';
   delete process.env.AGORA_TRUST_PROXY;
@@ -86,6 +87,15 @@ function cookieFrom(headers: Record<string, string>): string {
 }
 
 describe('household session', () => {
+  it('publishes the passcode only for a public demo', () => {
+    delete process.env.AGORA_DEMO_PUBLIC_PASSCODE;
+    expect(demoPasscode()).toBeUndefined();
+    process.env.AGORA_DEMO_PUBLIC_PASSCODE = '1';
+    expect(demoPasscode()).toBe('home-pass');
+    delete process.env.AGORA_HOUSEHOLD_PASSCODE;
+    expect(demoPasscode()).toBeUndefined();
+  });
+
   it('signs a cookie that verifies, and rejects a tampered one', async () => {
     const result = await call('POST', '/api/session', { host: 'localhost:3000', 'content-type': 'application/json' }, { passcode: 'home-pass' });
     expect(result.status).toBe(200);

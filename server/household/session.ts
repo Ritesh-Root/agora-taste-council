@@ -190,11 +190,21 @@ function delay(ms: number): Promise<void> {
 }
 
 /** GET, POST, and DELETE /api/session. */
+/**
+ * A public demo (fictional household) may publish its passcode on the lock screen so judges can walk in.
+ * Only when AGORA_DEMO_PUBLIC_PASSCODE=1; a real household never sends it.
+ */
+export function demoPasscode(): string | undefined {
+  if (process.env.AGORA_DEMO_PUBLIC_PASSCODE !== '1') return undefined;
+  return process.env.AGORA_HOUSEHOLD_PASSCODE?.trim() || undefined;
+}
+
 export async function handleSession(req: IncomingMessage, res: ServerResponse, passcode: string | null): Promise<void> {
   const method = req.method ?? 'GET';
   const required = householdLockEnabled();
   if (method === 'GET') {
-    sendJson(res, 200, { required, active: required ? householdSessionActive(req) : false });
+    const demo = required ? demoPasscode() : undefined;
+    sendJson(res, 200, { required, active: required ? householdSessionActive(req) : false, ...(demo ? { demoPasscode: demo } : {}) });
     return;
   }
   if (method === 'DELETE') {
