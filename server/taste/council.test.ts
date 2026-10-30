@@ -16,6 +16,7 @@ import {
   scoreShortlist,
   selectMembers,
 } from './council';
+import { entityMemoSaved, resetEntityMemo } from './entityMemo';
 import { entity, fakeQloo } from './fakeQloo';
 import { profileFromEntries } from './profile';
 import { setQlooCaller } from './qlooClient';
@@ -93,12 +94,17 @@ beforeEach(async () => {
   dir = await mkdtemp(path.join(tmpdir(), 'agora-taste-'));
   setDataDir(dir);
   resetRecentCouncils();
+  resetEntityMemo();
   delete process.env.AGORA_TASTE_LOCATION;
+  // The demo seed would swap the test family's names for real Qloo ids.
+  delete process.env.AGORA_DEMO_SEED;
 });
 
 afterEach(async () => {
   setQlooCaller(null);
   resetRecentCouncils();
+  await entityMemoSaved();
+  resetEntityMemo();
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -129,10 +135,11 @@ describe('runCouncil', () => {
     expect(result.calls.filter((call) => call.tool === 'qloo_recommend')).toHaveLength(3);
     expect(result.calls.filter((call) => call.tool === 'qloo_rank')).toHaveLength(3);
     expect(result.calls.every((call) => call.forWho)).toBe(true);
-    expect(fake.maxConcurrent).toBeLessThanOrEqual(2);
+    expect(fake.maxConcurrent).toBe(1);
 
     const recommend = fake.calls.find((call) => call.tool === 'qloo_recommend' && firstSignal(call.args) === 'Interstellar');
-    expect(recommend?.args).toMatchObject({ target_type: 'movie', limit: 8, exclude_tags: ['horror'] });
+    // Mia is 9, so films ask for 12 and the adult ones are left out.
+    expect(recommend?.args).toMatchObject({ target_type: 'movie', limit: 12, exclude_tags: ['horror'] });
     expect(recommend?.args).not.toHaveProperty('demographic');
     const rank = fake.calls.find((call) => call.tool === 'qloo_rank');
     expect(rank?.args).toMatchObject({ option_type: 'movie', options: ['f', 'd', 'a', 'b', 'g', 'e', 'c'] });
@@ -159,7 +166,8 @@ describe('runCouncil', () => {
     setQlooCaller(family({ rank: (signal) => (signal === 'Raj Kapoor' ? { status: 'error', summary: 'boom' } : null) }));
     const result = await runCouncil({ occasion: 'movie_night' }, { profile: FAMILY });
     expect(result.status).toBe('degraded');
-    expect(result.note).toMatch(/missing/);
+    expect(result.note).toBe('Qloo did not rank the shortlist for Dadi, so the picks use only the other ranks.');
+    expect(result.speech).toMatch(/^For movie night, Coco ranks in the top 2 for Arjun and Mia\. Qloo has no rank from Dadi for it\./);
     const coco = result.picks.find((pick) => pick.name === 'Coco');
     expect(coco?.fits.find((fit) => fit.who === 'Dadi')?.rank).toBeNull();
     expect(coco?.worstRank).toBe(2);
@@ -219,6 +227,88 @@ describe('runCouncil', () => {
     expect(result.status).toBe('ok');
   });
 
+  it('resolves a name once: the rank and the next council send the remembered id, with no needs_input', async () => {
+    const MOVIE = '649672ad-38a4-42c7-baac-bbd2d5beefa0';
+    const fake = fakeQloo((tool, args) => {
+      if ((args.signals as string[] | undefined)?.includes('Coco')) {
+        return { status: 'needs_input', summary: 'Choose or correct the unresolved Qloo inputs.', results: [], resolution: { issues: [{ input: 'Coco', field: 'signals', kind: 'ambiguous', candidates: [
+          { id: 'dfb3cf24-3bc9-402a-a3c5-051d76874910', name: 'Coco', type: 'urn:entity:album' },
+          { id: MOVIE, name: 'Coco', type: 'urn:entity:movie', description: 'Coco (2017)' },
+        ] }] } };
+      }
+      return { results: tool === 'qloo_recommend' ? [UP, FROZEN] : [FROZEN, UP] };
+    });
+    setQlooCaller(fake);
+    const profile = profileFromEntries(facts('Mia loves Coco'));
+    const first = await runCouncil({ occasion: 'movie_night' }, { profile });
+    expect(first.calls.map((call) => `${call.tool}:${call.status}`)).toEqual(['qloo_recommend:needs_input', 'qloo_recommend:ok', 'qloo_rank:ok']);
+    // The film, not the album Qloo listed first.
+    expect(fake.calls[1].args.signals).toEqual([MOVIE]);
+    expect(fake.calls[2].args.signals).toEqual([MOVIE]);
+
+    const again = await runCouncil({ occasion: 'tv_show' }, { profile });
+    expect(again.calls.map((call) => `${call.tool}:${call.status}`)).toEqual(['qloo_recommend:ok', 'qloo_rank:ok']);
+    expect(again.status).toBe('ok');
+
+    // After a restart the saved memo still knows Coco.
+    await entityMemoSaved();
+    resetEntityMemo();
+    const restarted = await runCouncil({ occasion: 'playlist' }, { profile });
+    expect(restarted.calls.every((call) => call.status === 'ok')).toBe(true);
+  });
+
+  it('asks for restaurants near the neighbourhood for dinner, and attractions (not restaurants) for an outing', async () => {
+    const fake = family();
+    setQlooCaller(fake);
+    await runCouncil({ occasion: 'dinner_out', location: 'Bandra, Mumbai' }, { profile: FAMILY });
+    const dinner = fake.calls.find((call) => call.tool === 'qloo_recommend');
+    expect(dinner?.args).toMatchObject({
+      target_type: 'place',
+      limit: 8,
+      filter_location: 'Bandra',
+      signal_location: 'Mumbai',
+      include_tags: ['urn:tag:genre:place:restaurant'],
+    });
+    expect(fake.calls.find((call) => call.tool === 'qloo_rank')?.args).toMatchObject({ signal_location: 'Mumbai' });
+
+    fake.calls.length = 0;
+    await runCouncil({ occasion: 'outing', location: 'Mumbai' }, { profile: FAMILY });
+    const outing = fake.calls.find((call) => call.tool === 'qloo_recommend');
+    expect(outing?.args).toMatchObject({ filter_location: 'Mumbai', signal_location: 'Mumbai', exclude_tags: ['urn:tag:genre:place:restaurant'], include_tags_operator: 'union' });
+    expect(outing?.args.include_tags).toEqual(expect.arrayContaining(['urn:tag:category:place:park', 'urn:tag:category:place:museum', 'urn:tag:category:place:amusement_park']));
+    expect((outing?.args.include_tags as string[]).length).toBeLessThanOrEqual(10);
+  });
+
+  it('leaves adult-rated and explicit titles out when a child is in the council, and says so', async () => {
+    const book = (id: string, name: string, properties: Record<string, unknown> = {}) => ({ ...entity(id, name, properties), type: 'urn:entity:book' });
+    const results = [
+      book('k1', 'The Subtle Art of Not Giving a F*ck'),
+      book('k2', 'Wonder', { content_rating: 'PG' }),
+      book('k3', 'Night Shift', { content_rating: 'R' }),
+      book('k4', 'Matilda'),
+      book('k5', 'Velvet Nights', { description: 'An erotic romance.' }),
+    ];
+    const fake = fakeQloo((tool, args) => {
+      if (tool === 'qloo_recommend') return { results };
+      const options = args.options as string[];
+      return { results: results.filter((item) => options.includes(item.entity_id as string)) };
+    });
+    setQlooCaller(fake);
+    const result = await runCouncil({ occasion: 'book_club' }, { profile: FAMILY });
+    expect(result.picks.map((pick) => pick.name)).toEqual(['Wonder', 'Matilda']);
+    expect(result.vetoes).toEqual([]);
+    expect(result.note).toMatch(/Left out 3 suggestions rated for adults or with an explicit title, because Mia is under 18\./);
+    expect(fake.calls.find((call) => call.tool === 'qloo_rank')?.args.options).toEqual(['k2', 'k4']);
+    expect(fake.calls.find((call) => call.tool === 'qloo_recommend')?.args.limit).toBe(12);
+
+    // Adults only: nothing is left out, and the list size is the usual 8.
+    fake.calls.length = 0;
+    const adults = await runCouncil({ occasion: 'book_club', who: ['Arjun', 'Dadi'] }, { profile: FAMILY });
+    expect(adults.picks).toHaveLength(5);
+    expect(adults.note).toBeUndefined();
+    expect(fake.calls.find((call) => call.tool === 'qloo_recommend')?.args.limit).toBe(8);
+  });
+
   it('leaves a person with only abstract likes out of the ranking without degrading', async () => {
     const fake = fakeQloo((tool) => ({ results: tool === 'qloo_recommend' ? [COCO, FROZEN] : [FROZEN, COCO] }));
     setQlooCaller(fake);
@@ -230,7 +320,7 @@ describe('runCouncil', () => {
     const rohanRecommend = fake.calls.find((call) => call.tool === 'qloo_recommend' && !call.args.signals);
     expect(rohanRecommend?.args).toMatchObject({ signal_tags: ['thrillers'], signal_tags_operator: 'union' });
     expect(result.picks[0].name).toBe('Frozen');
-    expect(result.speech).toBe("For movie night, Frozen is Mia's top choice.");
+    expect(result.speech).toBe("For movie night, Frozen is Mia's top choice. Qloo has no rank from Rohan for it.");
     expect(result.picks[0].fits).toEqual([
       { who: 'Mia', rank: 1, of: 2, because: ['Encanto'] },
       { who: 'Rohan', rank: null, of: 2, because: [] },
@@ -290,15 +380,17 @@ describe('runCouncil', () => {
       return handle(tool, args);
     };
     setQlooCaller(slow);
-    // Two slots: two recommends finish at ~250 ms, past the 150 ms deadline, so the third
-    // recommend and every rank are skipped.
+    // One slot: the first recommend finishes at ~250 ms, past the 150 ms deadline, so the other
+    // recommends and every rank are skipped.
     const result = await runCouncil({ occasion: 'movie_night' }, { profile: FAMILY, deadlineMs: 150 });
     expect(result.status).toBe('degraded');
     expect(result.note).toMatch(/ran out of time/);
     expect(result.picks.length).toBeGreaterThan(0);
-    expect(slow.calls.filter((call) => call.tool === 'qloo_recommend')).toHaveLength(2);
+    expect(slow.calls.filter((call) => call.tool === 'qloo_recommend')).toHaveLength(1);
     expect(slow.calls.filter((call) => call.tool === 'qloo_rank')).toHaveLength(0);
-    expect(result.calls).toHaveLength(2);
+    expect(result.calls).toHaveLength(1);
+    // Nobody was ranked, so the speech claims no ranks.
+    expect(result.speech).toMatch(/Qloo's suggestions point to/);
   });
 
   it('is an error that says so when the deadline passes before any answer', async () => {
@@ -397,5 +489,18 @@ describe('maximin helpers', () => {
     const pick = { name: 'Up', worstRank: 6, meanRank: 4, tags: [], fits: [fit('A', 2), fit('B', 6)] };
     expect(councilSpeech('book_club', [pick], [])).toBe('For book club, Up is the fairest pick: nobody ranks it lower than 6th of 10.');
     expect(councilSpeech('outing', [], [{ name: 'X', fact: 'Mia is allergic to peanuts', who: 'Mia' }])).toMatch(/Keeper set aside every option/);
+  });
+
+  it('never says someone ranked a pick they did not, and claims no ranks without rankings', () => {
+    const fit = (who: string, rank: number | null) => ({ who, rank, of: 10, because: [] });
+    const pick = { name: 'Up', worstRank: 10, meanRank: 4, tags: [], fits: [fit('Arjun', 2), fit('Mia', 1), fit('Dadi', null)] };
+    const speech = councilSpeech('movie_night', [pick], []);
+    expect(speech).toBe('For movie night, Up ranks in the top 2 for Arjun and Mia. Qloo has no rank from Dadi for it.');
+    expect(speech).not.toMatch(/everyone|Dadi (?:and|rank)/);
+    expect(councilSpeech('movie_night', [pick], [], { ranked: false })).toBe("For movie night, Qloo's suggestions point to Up.");
+    const late = { ...pick, fits: [fit('Arjun', 6), fit('Dadi', null)] };
+    expect(councilSpeech('tv_show', [late], [])).toBe('For a show together, Up ranks 6th for Arjun. Qloo has no rank from Dadi for it.');
+    const malala = { ...pick, name: 'I Am Malala: The Story of the Girl Who Stood Up for Education', fits: [fit('Mia', 1)] };
+    expect(councilSpeech('book_club', [malala], [])).toBe("For book club, I Am Malala is Mia's top choice.");
   });
 });

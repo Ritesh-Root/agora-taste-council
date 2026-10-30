@@ -7,8 +7,11 @@ import type { QlooCallRecord } from '../../shared/taste';
  * The child gets the SDK's minimal environment plus the Qloo settings (qlooChildEnv), never the
  * rest of ours. The key never leaves the child and is never logged or returned here.
  *
- * Every call goes through a small LRU cache (30 min) and a two-slot semaphore, so a council
- * of four people cannot burst the Qloo event quota.
+ * Every call goes through a small LRU cache (30 min) and a one-slot semaphore (AGORA_QLOO_IN_FLIGHT),
+ * so a council of four people cannot burst the Qloo rate limit. The harness resolves every name and
+ * id in a call with its own parallel Qloo requests, so one call is already a small burst. A
+ * rate-limited (429) or other retryable answer is retried twice, 1.5 s then 4 s later, within the
+ * caller's deadline.
  */
 
 export type QlooStatus = QlooCallRecord['status'];
@@ -17,7 +20,18 @@ export interface QlooIssue {
   input: string;
   field?: string;
   kind?: string;
-  candidates: { id: string; name?: string }[];
+  /** The resolver's scope for this input (a Qloo entity type), when the harness gave one. */
+  scope?: string;
+  candidates: { id: string; name?: string; type?: string; description?: string }[];
+}
+
+/** One input the harness resolved, from `interpretation` on a successful result. */
+export interface QlooResolved {
+  field: string;
+  input: string;
+  id: string;
+  name?: string;
+  type?: string;
 }
 
 /** The harness result envelope, normalized. */
@@ -26,9 +40,11 @@ export interface QlooEnvelope {
   summary: string;
   results: unknown[];
   result_count: number;
-  error?: { code?: string; recovery?: string };
+  error?: { code?: string; recovery?: string; retryable?: boolean };
   /** Unresolved inputs from a needs_input result. */
   issues?: QlooIssue[];
+  /** Inputs the harness resolved to Qloo ids, from a successful result. */
+  resolved?: QlooResolved[];
 }
 
 /** Raw tool result, as the MCP client returns it. */
@@ -55,7 +71,20 @@ const CONNECT_TIMEOUT_MS = 8_000;
 const READY_TIMEOUT_MS = 8_000;
 const CACHE_TTL_MS = 30 * 60_000;
 const CACHE_MAX = 200;
-const MAX_IN_FLIGHT = 2;
+const DEFAULT_IN_FLIGHT = 1;
+/** Waits before the first and second retry of a rate-limited or otherwise retryable call. */
+const DEFAULT_RETRY_DELAYS_MS: readonly number[] = [1_500, 4_000];
+let retryDelaysMs: readonly number[] = DEFAULT_RETRY_DELAYS_MS;
+
+/** Tests: shorter retry waits. null restores the defaults. */
+export function setQlooRetryDelays(delays: readonly number[] | null): void {
+  retryDelaysMs = delays ?? DEFAULT_RETRY_DELAYS_MS;
+}
+
+function maxInFlight(): number {
+  const value = Number.parseInt(process.env.AGORA_QLOO_IN_FLIGHT ?? '', 10);
+  return Number.isFinite(value) && value >= 1 && value <= 4 ? value : DEFAULT_IN_FLIGHT;
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
@@ -239,7 +268,7 @@ let inFlight = 0;
 const waiting: (() => void)[] = [];
 
 async function acquire(): Promise<void> {
-  if (inFlight < MAX_IN_FLIGHT) {
+  if (inFlight < maxInFlight()) {
     inFlight += 1;
     return;
   }
@@ -287,15 +316,42 @@ function issuesOf(structured: Record<string, unknown>): QlooIssue[] {
       .map((candidate) => ({
         id: candidate.id as string,
         ...(typeof candidate.name === 'string' ? { name: candidate.name } : {}),
+        ...(typeof candidate.type === 'string' ? { type: candidate.type } : {}),
+        ...(typeof candidate.description === 'string' ? { description: candidate.description.slice(0, 200) } : {}),
       }));
     issues.push({
       input: record.input,
       ...(typeof record.field === 'string' ? { field: record.field } : {}),
       ...(typeof record.kind === 'string' ? { kind: record.kind } : {}),
+      ...(typeof record.scope === 'string' ? { scope: record.scope } : {}),
       candidates,
     });
   }
   return issues;
+}
+
+/** What the harness resolved each name or tag to, from `interpretation` (entities: entityId, tags: tagId). */
+function resolvedOf(structured: Record<string, unknown>): QlooResolved[] {
+  const interpretation = asRecord(structured.interpretation);
+  if (!interpretation) return [];
+  const out: QlooResolved[] = [];
+  for (const field of ['signals', 'signal_tags', 'include_tags', 'exclude_tags', 'options']) {
+    const list = interpretation[field];
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      const record = asRecord(item);
+      const id = record?.entityId ?? record?.tagId;
+      if (!record || typeof record.input !== 'string' || typeof id !== 'string' || !id) continue;
+      out.push({
+        field,
+        input: record.input,
+        id,
+        ...(typeof record.name === 'string' ? { name: record.name } : {}),
+        ...(typeof record.type === 'string' ? { type: record.type } : {}),
+      });
+    }
+  }
+  return out;
 }
 
 /** Turn whatever `qloo mcp` returned into the harness envelope. Never throws. */
@@ -331,10 +387,13 @@ export function normalizeEnvelope(raw: QlooRawResult | null | undefined): QlooEn
     envelope.error = {
       ...(typeof errorRecord.code === 'string' ? { code: errorRecord.code } : {}),
       ...(typeof errorRecord.recovery === 'string' ? { recovery: errorRecord.recovery.slice(0, 200) } : {}),
+      ...(typeof errorRecord.retryable === 'boolean' ? { retryable: errorRecord.retryable } : {}),
     };
   }
   const issues = issuesOf(structured);
   if (issues.length > 0) envelope.issues = issues;
+  const resolved = resolvedOf(structured);
+  if (resolved.length > 0) envelope.resolved = resolved;
   return envelope;
 }
 
@@ -346,11 +405,25 @@ function safeMessage(error: unknown): string {
   return scrubbed.slice(0, 200);
 }
 
+/** A rate limit (429) or a harness error it marks retryable. Not our own 20 s timeout: no time for it. */
+export function isRetryable(envelope: QlooEnvelope): boolean {
+  if (envelope.status !== 'error') return false;
+  if (envelope.error?.code === 'QLOO_RATE_LIMIT') return true;
+  if (/\b429\b|rate.?limit/i.test(envelope.summary)) return true;
+  if (/timed out after/i.test(envelope.summary)) return false;
+  return envelope.error?.retryable === true;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Call one Qloo MCP tool. Cached for 30 minutes per tool+args (ok and empty results only),
- * at most two in flight, 20 s each. Errors come back as an error envelope, never a throw.
- * With a `deadline` (epoch ms) that has passed by the time a slot frees, no call is made:
- * the envelope is an error and `skipped` is true.
+ * one in flight by default, 20 s each. Errors come back as an error envelope, never a throw.
+ * A retryable error (429) is retried up to twice, holding the slot so other calls back off too,
+ * but only when the wait still ends before `deadline`. With a `deadline` (epoch ms) that has
+ * passed by the time a slot frees, no call is made: the envelope is an error and `skipped` is true.
  */
 export async function callQloo(
   tool: string,
@@ -362,6 +435,7 @@ export async function callQloo(
   const started = Date.now();
   let envelope = cacheGet(key);
   let skipped = false;
+  let retries = 0;
   if (!envelope) {
     await acquire();
     try {
@@ -369,11 +443,20 @@ export async function callQloo(
         skipped = true;
         envelope = { status: 'error', summary: 'Skipped: out of time.', results: [], result_count: 0 };
       } else {
-        const raw = await currentCaller().callTool(tool, args);
-        envelope = normalizeEnvelope(raw);
+        for (let attempt = 0; ; attempt += 1) {
+          try {
+            envelope = normalizeEnvelope(await currentCaller().callTool(tool, args));
+          } catch (error) {
+            envelope = { status: 'error', summary: safeMessage(error), results: [], result_count: 0 };
+          }
+          const wait = retryDelaysMs[attempt];
+          if (wait === undefined || !isRetryable(envelope)) break;
+          if (deadline !== undefined && Date.now() + wait >= deadline) break;
+          console.warn(`[taste] ${tool} for ${forWho ?? 'council'}: ${envelope.error?.code ?? 'retryable error'}, retrying in ${wait} ms`);
+          await sleep(wait);
+          retries += 1;
+        }
       }
-    } catch (error) {
-      envelope = { status: 'error', summary: safeMessage(error), results: [], result_count: 0 };
     } finally {
       release();
     }
@@ -388,6 +471,7 @@ export async function callQloo(
     ms: Date.now() - started,
   };
   if (forWho) record.forWho = forWho;
+  if (retries > 0) record.retries = retries;
   return skipped ? { envelope, record, skipped: true } : { envelope, record };
 }
 

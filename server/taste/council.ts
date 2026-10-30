@@ -11,6 +11,7 @@ import {
   type TasteSnapshot,
 } from '../../shared/taste';
 import { loadJsonFile, writeJson } from '../household/store';
+import { learnFromEnvelope, loadEntityMemo, withKnownIds } from './entityMemo';
 import { buildTasteProfile, type TasteProfile } from './profile';
 import { callQloo, qlooReadiness, type QlooEnvelope } from './qlooClient';
 
@@ -27,6 +28,8 @@ const RECENT_MAX = 5;
 const MAX_SIGNALS = 4;
 const MAX_TAGS = 3;
 const RECOMMEND_LIMIT = 8;
+/** With a child in the council, films, shows and books ask for more, so the adult ones can be left out. */
+const RECOMMEND_LIMIT_WITH_CHILD = 12;
 /** qloo_rank accepts at most 10 options. */
 const SHORTLIST_MAX = 10;
 const PICKS_MAX = 5;
@@ -59,6 +62,61 @@ export function demographicFor(member: TasteMember): string | undefined {
   return member.ageBand ? AGE_PHRASE[member.ageBand] : undefined;
 }
 
+// ---- places ----
+
+/** Qloo's restaurant genre: dinner out returns places to eat. */
+const DINNER_TAGS = ['urn:tag:genre:place:restaurant'];
+/** Qloo place categories for a family day out (qloo_recommend takes at most 10 include tags). */
+const OUTING_TAGS = [
+  'urn:tag:category:place:museum',
+  'urn:tag:category:place:park',
+  'urn:tag:category:place:amusement_park',
+  'urn:tag:category:place:tourist_attraction',
+  'urn:tag:category:place:zoo',
+  'urn:tag:category:place:aquarium',
+  'urn:tag:category:place:science_museum',
+  'urn:tag:category:place:water_park',
+  'urn:tag:category:place:theme_park',
+  'urn:tag:category:place:botanical_garden',
+];
+
+/**
+ * Qloo matches a location string as one place name: "Bandra, Mumbai" finds nothing, while "Bandra"
+ * and "Mumbai" both work. So places are filtered to the first part ("Bandra"), and the audience
+ * signal uses the next part, the city ("Mumbai"). A single name is used for both.
+ */
+export function splitLocation(location: string): { signal: string; filter: string } {
+  const parts = location.split(',').map((part) => part.trim()).filter((part) => part.length > 0);
+  if (parts.length < 2) return { signal: location.trim(), filter: location.trim() };
+  return { signal: parts[1], filter: parts[0] };
+}
+
+// ---- children ----
+
+/** Ratings meant for adults only: MPA, US TV, Indian CBFC, and common 18 marks. */
+const ADULT_RATING = /^(?:r|nc-?17|tv-?ma|a|x|xxx|ao|18\+?|r-?18|m-?18|ma-?18|nr-?18)$/i;
+/** Profanity in a title, masked or not ("F*ck", "Sh*t"). Checked on names only. */
+const PROFANE_TITLE = [
+  /f(?:u|\*)(?:c|\*)k/i,
+  /\bsh(?:i|\*|!)t/i,
+  /\bb(?:i|\*)tch/i,
+  /\bc(?:u|\*)nt\b/i,
+  /\ba(?:ss|\*\*)hole/i,
+  /\bbastard/i,
+  /\bmotherf/i,
+];
+/** Adult content named in the title or Qloo's description. */
+const ADULT_TOPIC = /\b(?:erotic\w*|porn\w*|xxx|nsfw|explicit sex\w*)\b/i;
+
+/** Why a candidate is not for a council with a child in it, or null when it is fine. */
+export function adultReason(candidate: Pick<Candidate, 'name' | 'rating' | 'text'>): 'rating' | 'title' | null {
+  const rating = candidate.rating?.trim().replace(/^(?:rated|certificate)\s+/i, '');
+  if (rating && ADULT_RATING.test(rating)) return 'rating';
+  if (PROFANE_TITLE.some((pattern) => pattern.test(candidate.name))) return 'title';
+  if (ADULT_TOPIC.test(candidate.text)) return 'title';
+  return null;
+}
+
 // ---- candidates ----
 
 interface Candidate {
@@ -68,6 +126,8 @@ interface Candidate {
   subtitle?: string;
   imageUrl?: string;
   tags: string[];
+  /** Qloo's content rating ("PG-13", "TV-MA"), when it returned one. */
+  rating?: string;
   /** Name, tags, subtitle, description: what Keeper reads. */
   text: string;
 }
@@ -140,6 +200,8 @@ export function candidateFrom(raw: unknown): Candidate | null {
   };
   if (entityId) candidate.entityId = entityId;
   if (subtitle) candidate.subtitle = subtitle;
+  const rating = str(props?.content_rating);
+  if (rating) candidate.rating = rating.slice(0, 20);
   const imageUrl = imageOf(item, props);
   if (imageUrl) candidate.imageUrl = imageUrl;
   return candidate;
@@ -303,7 +365,24 @@ function ordinal(n: number): string {
   return `${n}${['th', 'st', 'nd', 'rd'][n % 10] ?? 'th'}`;
 }
 
-export function councilSpeech(occasion: TasteOccasion, picks: CouncilPick[], vetoes: KeeperVeto[]): string {
+/**
+ * The spoken sentence, from the winner's ranks. Only people Qloo actually ranked it for are named as
+ * ranking it; anyone else is named as not ranked. With `ranked: false` (no qloo_rank call answered,
+ * so the order is each person's recommendations), it says so and claims no ranks.
+ */
+/** A long subtitled title is spoken by its main part: "I Am Malala: The Story of ..." -> "I Am Malala". */
+export function spokenName(name: string): string {
+  if (name.length <= 40) return name;
+  const main = name.split(/:\s/)[0]?.trim();
+  return main && main.length >= 3 ? main : name;
+}
+
+export function councilSpeech(
+  occasion: TasteOccasion,
+  picks: CouncilPick[],
+  vetoes: KeeperVeto[],
+  options: { ranked?: boolean } = {},
+): string {
   const phrase = OCCASION_PHRASE[occasion];
   const top = picks[0];
   if (!top) {
@@ -311,29 +390,36 @@ export function councilSpeech(occasion: TasteOccasion, picks: CouncilPick[], vet
       ? `Keeper set aside every option Qloo found for ${phrase}, so I have no pick yet.`
       : `Qloo did not find options for ${phrase} this time.`;
   }
-  const ranked = top.fits.filter((fit) => fit.rank !== null);
+  const name = spokenName(top.name);
+  const ranked = options.ranked === false ? [] : top.fits.filter((fit) => fit.rank !== null);
+  const unranked = options.ranked === false ? [] : top.fits.filter((fit) => fit.rank === null).map((fit) => fit.who);
   const people = listNames(ranked.map((fit) => fit.who));
+  const everyone = unranked.length === 0;
+  const worst = Math.max(0, ...ranked.map((fit) => fit.rank ?? 0));
   let first: string;
-  const everyone = ranked.length === top.fits.length;
-  const worst = top.worstRank;
-  if (ranked.length === 0) {
-    first = `For ${phrase}, Qloo suggests ${top.name}.`;
+  if (options.ranked === false) {
+    first = `For ${phrase}, Qloo's suggestions point to ${name}.`;
+  } else if (ranked.length === 0) {
+    first = `For ${phrase}, Qloo suggests ${name}.`;
   } else if (ranked.length > 1 && everyone && worst === 1) {
-    first = `For ${phrase}, ${top.name} is everyone's first choice: ${people} ${ranked.length === 2 ? 'both' : 'all'} rank it first.`;
+    first = `For ${phrase}, ${name} is everyone's first choice: ${people} ${ranked.length === 2 ? 'both' : 'all'} rank it first.`;
   } else if (ranked.length === 1) {
     first = worst === 1
-      ? `For ${phrase}, ${top.name} is ${people}'s top choice.`
-      : `For ${phrase}, ${top.name} ranks ${ordinal(worst)} for ${people}.`;
+      ? `For ${phrase}, ${name} is ${people}'s top choice.`
+      : `For ${phrase}, ${name} ranks ${ordinal(worst)} for ${people}.`;
   } else if (worst <= 3) {
     first = everyone
-      ? `For ${phrase}, ${top.name} works for everyone: it ranks in the top ${worst} for ${people}.`
-      : `For ${phrase}, ${top.name} ranks in the top ${worst} for ${people}.`;
+      ? `For ${phrase}, ${name} works for everyone: it ranks in the top ${worst} for ${people}.`
+      : `For ${phrase}, ${name} ranks in the top ${worst} for ${people}.`;
   } else {
-    first = `For ${phrase}, ${top.name} is the fairest pick: nobody ranks it lower than ${ordinal(worst)} of ${top.fits[0]?.of ?? picks.length}.`;
+    first = everyone
+      ? `For ${phrase}, ${name} is the fairest pick: nobody ranks it lower than ${ordinal(worst)} of ${top.fits[0]?.of ?? picks.length}.`
+      : `For ${phrase}, ${name} is the fairest pick: ${people} rank it no lower than ${ordinal(worst)} of ${top.fits[0]?.of ?? picks.length}.`;
   }
+  const missing = ranked.length > 0 && unranked.length > 0 ? ` Qloo has no rank from ${listNames(unranked)} for it.` : '';
   const veto = vetoes[0];
-  const second = veto ? ` Keeper set aside ${veto.name} because ${veto.fact.replace(/[.!?]+$/, '')}.` : '';
-  return `${first}${second}`;
+  const second = veto ? ` Keeper set aside ${spokenName(veto.name)} because ${veto.fact.replace(/[.!?]+$/, '')}.` : '';
+  return `${first}${missing}${second}`;
 }
 
 // ---- recent ----
@@ -380,12 +466,14 @@ function cleanList(values: string[] | undefined, max: number): string[] {
   return (values ?? []).map((value) => value.trim()).filter((value) => value.length > 0).slice(0, max);
 }
 
-/** On needs_input: swap an ambiguous input for Qloo's first candidate id, drop the unresolvable ones. */
+/**
+ * On needs_input. learnFromEnvelope has already remembered a choice for each unresolved name and tag
+ * (a work or artist over an album of the same name, see chooseEntity), so withKnownIds swaps them in.
+ * What is left: an option Qloo cannot resolve is dropped, and a demographic it cannot read is dropped.
+ */
 function repairArgs(args: Record<string, unknown>, envelope: QlooEnvelope): Record<string, unknown> | null {
+  const next = withKnownIds(args);
   const issues = envelope.issues ?? [];
-  if (issues.length === 0) return null;
-  const next: Record<string, unknown> = { ...args };
-  let changed = false;
   for (const field of ['signals', 'signal_tags', 'exclude_tags', 'include_tags', 'options']) {
     const values = next[field];
     if (!Array.isArray(values)) continue;
@@ -396,18 +484,15 @@ function repairArgs(args: Record<string, unknown>, envelope: QlooEnvelope): Reco
         repaired.push(value);
         continue;
       }
-      changed = true;
+      // Not remembered (an option, or a field the memo does not keep): first candidate, else drop.
       const candidate = issue.candidates[0]?.id;
       if (candidate && field !== 'options') repaired.push(candidate);
     }
     if (repaired.length > 0) next[field] = repaired;
     else delete next[field];
   }
-  if (/demographic/i.test(envelope.summary) && next.demographic) {
-    delete next.demographic;
-    changed = true;
-  }
-  return changed ? next : null;
+  if (/demographic/i.test(envelope.summary) && next.demographic) delete next.demographic;
+  return JSON.stringify(next) !== JSON.stringify(args) ? next : null;
 }
 
 /** The council's time budget. `outOfTime` is set when a call was skipped for it. */
@@ -416,6 +501,10 @@ interface Budget {
   outOfTime: boolean;
 }
 
+/**
+ * One Qloo call with remembered ids swapped in first, and one repair on needs_input. Every answer
+ * teaches the entity memo, so the next call (and the next council) sends ids and skips the repair.
+ */
 async function callWithRepair(
   tool: string,
   args: Record<string, unknown>,
@@ -423,17 +512,22 @@ async function callWithRepair(
   calls: QlooCallRecord[],
   budget: Budget,
 ): Promise<{ envelope: QlooEnvelope; args: Record<string, unknown> }> {
-  const first = await callQloo(tool, args, who, budget.deadline);
+  const sent = withKnownIds(args);
+  const first = await callQloo(tool, sent, who, budget.deadline);
   if (first.skipped) {
     budget.outOfTime = true;
-    return { envelope: first.envelope, args };
+    return { envelope: first.envelope, args: sent };
   }
   calls.push(first.record);
-  if (first.envelope.status !== 'needs_input') return { envelope: first.envelope, args };
-  const repaired = repairArgs(args, first.envelope);
-  if (!repaired) return { envelope: first.envelope, args };
+  learnFromEnvelope(sent, first.envelope);
+  if (first.envelope.status !== 'needs_input') return { envelope: first.envelope, args: sent };
+  const repaired = repairArgs(sent, first.envelope);
+  if (!repaired) return { envelope: first.envelope, args: sent };
   if (tool === 'qloo_recommend' && !repaired.signals && !repaired.signal_tags && !repaired.demographic && !repaired.signal_location) {
-    return { envelope: first.envelope, args };
+    return { envelope: first.envelope, args: sent };
+  }
+  if (tool === 'qloo_rank' && (!Array.isArray(repaired.options) || repaired.options.length === 0)) {
+    return { envelope: first.envelope, args: sent };
   }
   const second = await callQloo(tool, repaired, who, budget.deadline);
   if (second.skipped) {
@@ -441,6 +535,7 @@ async function callWithRepair(
     return { envelope: second.envelope, args: repaired };
   }
   calls.push(second.record);
+  learnFromEnvelope(repaired, second.envelope);
   return { envelope: second.envelope, args: repaired };
 }
 
@@ -454,7 +549,7 @@ function sharedSignals(member: TasteMember, location: string | undefined, target
   if (loves.length > 0) args.signals = loves;
   // Qloo needs a location with a demographic, so the audience geography is explicit.
   if (location) {
-    args.signal_location = location;
+    args.signal_location = splitLocation(location).signal;
     const demographic = demographicFor(member);
     if (demographic) args.demographic = demographic;
   }
@@ -463,6 +558,24 @@ function sharedSignals(member: TasteMember, location: string | undefined, target
     .filter((value): value is string => !!value)
     .slice(0, 3);
   if (avoid.length > 0 && target !== 'place') args.exclude_tags = avoid;
+  return args;
+}
+
+/** What qloo_recommend gets beyond the shared signals: place kind and area, and a bigger list for a child. */
+function recommendFilters(occasion: TasteOccasion, location: string | undefined, withChild: boolean): Record<string, unknown> {
+  const target = OCCASION_TARGET[occasion];
+  const args: Record<string, unknown> = {};
+  if (target === 'place') {
+    if (location) args.filter_location = splitLocation(location).filter;
+    if (occasion === 'dinner_out') {
+      args.include_tags = DINNER_TAGS;
+    } else {
+      args.include_tags = OUTING_TAGS;
+      args.include_tags_operator = 'union';
+      args.exclude_tags = DINNER_TAGS;
+    }
+  }
+  if (withChild && target !== 'place') args.limit = RECOMMEND_LIMIT_WITH_CHILD;
   return args;
 }
 
@@ -548,27 +661,45 @@ export async function runCouncil(
 
   const calls: QlooCallRecord[] = [];
   const budget: Budget = { deadline: started + (deps.deadlineMs ?? COUNCIL_DEADLINE_MS), outOfTime: false };
-  /** Calls whose final answer (after one repair) was not usable. A repaired needs_input is not a failure. */
-  let failures = 0;
+  await loadEntityMemo();
+  const children = members.filter((member) => member.ageBand === '0-17').map((member) => member.who);
+  const childSafe = children.length > 0 && target !== 'place';
+  const leftOutForChildren = new Set<string>();
+  /** People whose qloo_recommend answer (after one repair) was not usable. A repaired needs_input is not a failure. */
+  const recommendFailed: string[] = [];
 
   // b. Candidates per person.
   const perMember = await Promise.all(members.map(async (member) => {
-    const args: Record<string, unknown> = { target_type: target, limit: RECOMMEND_LIMIT, ...sharedSignals(member, location, target) };
+    const args: Record<string, unknown> = {
+      target_type: target,
+      limit: RECOMMEND_LIMIT,
+      ...sharedSignals(member, location, target),
+      ...recommendFilters(occasion, location, childSafe),
+    };
     const tags = cleanList(member.likesTags, MAX_TAGS);
     if (tags.length > 0) {
       args.signal_tags = tags;
       args.signal_tags_operator = 'union';
     }
-    if (target === 'place' && location) args.filter_location = location;
     if (!args.signals && !args.signal_tags && !args.signal_location) return { member, list: [] as Candidate[], ok: false };
     const { envelope } = await callWithRepair('qloo_recommend', args, member.who, calls, budget);
     if (!usable(envelope.status)) {
-      failures += 1;
+      recommendFailed.push(member.who);
       return { member, list: [] as Candidate[], ok: false };
     }
-    const list = envelope.results.map(candidateFrom).filter((candidate): candidate is Candidate => !!candidate);
+    let list = envelope.results.map(candidateFrom).filter((candidate): candidate is Candidate => !!candidate);
+    if (childSafe) {
+      list = list.filter((candidate) => {
+        if (!adultReason(candidate)) return true;
+        leftOutForChildren.add(candidate.key);
+        return false;
+      });
+    }
     return { member, list, ok: true };
   }));
+  const childNote = leftOutForChildren.size > 0
+    ? `Left out ${leftOutForChildren.size === 1 ? 'one suggestion' : `${leftOutForChildren.size} suggestions`} rated for adults or with an explicit title, because ${listNames(children)} ${children.length === 1 ? 'is' : 'are'} under 18.`
+    : undefined;
 
   const anyRecommend = perMember.some((entry) => entry.ok);
   if (!anyRecommend) {
@@ -586,8 +717,11 @@ export async function runCouncil(
       vetoes: [],
       speech: councilSpeech(occasion, [], []),
       calls,
-      status: failures > 0 ? 'degraded' : 'ok',
-      note: budget.outOfTime ? OUT_OF_TIME_NOTE : 'Qloo returned no candidates for these tastes.',
+      status: recommendFailed.length > 0 || budget.outOfTime ? 'degraded' : 'ok',
+      note: [
+        budget.outOfTime ? OUT_OF_TIME_NOTE : 'Qloo returned no candidates for these tastes.',
+        childNote,
+      ].filter(Boolean).join(' '),
       ms: Date.now() - started,
     };
     await remember(result);
@@ -607,7 +741,6 @@ export async function runCouncil(
     const args: Record<string, unknown> = { options, option_type: target, ...sharedSignals(member, location, target) };
     if (!args.signals && !args.signal_location) return { who: member.who, because, order: null, skipped: true };
     const { envelope } = await callWithRepair('qloo_rank', args, member.who, calls, budget);
-    if (!usable(envelope.status)) failures += 1;
     if (!usable(envelope.status) || envelope.results.length === 0) return { who: member.who, because, order: null };
     const order: string[] = [];
     for (const raw of envelope.results) {
@@ -635,13 +768,19 @@ export async function runCouncil(
   const { kept, vetoes } = keeperCheck(scored, members, target, profile.constraintFacts);
   const picks = kept.slice(0, PICKS_MAX).map(pickFrom);
 
-  const failed = failures > 0 || !anyRanking || rankings.some((ranking) => !ranking.order && !ranking.skipped);
+  const rankFailed = rankings.filter((ranking) => !ranking.order && !ranking.skipped).map((ranking) => ranking.who);
+  const failed = recommendFailed.length > 0 || rankFailed.length > 0 || !anyRanking;
   const notes: string[] = [];
   if (budget.outOfTime) notes.push(OUT_OF_TIME_NOTE);
-  if (!anyRanking) notes.push('Qloo did not rank the shortlist, so picks follow each person\'s recommendations.');
-  else if (failed && !budget.outOfTime) notes.push('Some Qloo calls did not answer, so a few ranks are missing.');
+  if (!anyRanking) {
+    notes.push('Qloo did not rank the shortlist, so picks follow each person\'s suggestions, not their ranks.');
+  } else if (rankFailed.length > 0) {
+    notes.push(`Qloo did not rank the shortlist for ${listNames(rankFailed)}, so the picks use only the other ranks.`);
+  }
+  if (recommendFailed.length > 0) notes.push(`Qloo suggested nothing for ${listNames(recommendFailed)}, so the shortlist comes from the others.`);
   const skipped = rankings.filter((ranking) => ranking.skipped).map((ranking) => ranking.who);
   if (skipped.length > 0) notes.push(`${listNames(skipped)} named no favourite title or artist, so Qloo could not rank for them.`);
+  if (childNote) notes.push(childNote);
   if (missing.length > 0) notes.push(`No taste facts for ${listNames(missing)}.`);
   if (target === 'place' && !location) notes.push('No location was given, so places may be far away.');
 
@@ -649,7 +788,7 @@ export async function runCouncil(
     ...base,
     picks,
     vetoes,
-    speech: councilSpeech(occasion, picks, vetoes),
+    speech: councilSpeech(occasion, picks, vetoes, { ranked: anyRanking }),
     calls,
     status: failed ? 'degraded' : 'ok',
     startedAt,

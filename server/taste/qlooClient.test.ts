@@ -4,7 +4,7 @@ import path from 'path';
 import type { Client } from '@modelcontextprotocol/client';
 import { afterEach, describe, expect, it } from 'vitest';
 import { fakeQloo } from './fakeQloo';
-import { callQloo, createStdioQlooCaller, normalizeEnvelope, qlooChildEnv, qlooInFlight, qlooReady, setQlooCaller } from './qlooClient';
+import { callQloo, createStdioQlooCaller, normalizeEnvelope, qlooChildEnv, qlooInFlight, qlooReady, setQlooCaller, setQlooRetryDelays } from './qlooClient';
 
 let scratch = '';
 
@@ -37,8 +37,25 @@ describe('normalizeEnvelope', () => {
         resolution: { issues: [{ input: 'Coco', field: 'signals', kind: 'ambiguous', candidates: [{ id: 'u1', name: 'Coco (2017)' }, { bad: true }] }] },
       },
     });
-    expect(envelope.error).toEqual({ code: 'QLOO_AUTH', recovery: 'Run qloo setup' });
+    expect(envelope.error).toEqual({ code: 'QLOO_AUTH', recovery: 'Run qloo setup', retryable: false });
     expect(envelope.issues).toEqual([{ input: 'Coco', field: 'signals', kind: 'ambiguous', candidates: [{ id: 'u1', name: 'Coco (2017)' }] }]);
+  });
+
+  it('reads what the harness resolved each input to', () => {
+    const envelope = normalizeEnvelope({
+      structuredContent: {
+        status: 'ok',
+        results: [],
+        interpretation: {
+          signals: [{ input: 'Coco', entityId: 'u-movie', name: 'Coco', type: 'urn:entity:movie', match: 'exact' }, { input: 'bad' }],
+          signal_tags: [{ input: 'thrillers', tagId: 'urn:tag:genre:media:thriller', name: 'Thriller' }],
+        },
+      },
+    });
+    expect(envelope.resolved).toEqual([
+      { field: 'signals', input: 'Coco', id: 'u-movie', name: 'Coco', type: 'urn:entity:movie' },
+      { field: 'signal_tags', input: 'thrillers', id: 'urn:tag:genre:media:thriller', name: 'Thriller' },
+    ]);
   });
 });
 
@@ -60,16 +77,73 @@ describe('callQloo', () => {
     expect(fake.calls.map((call) => call.tool)).toEqual(['qloo_recommend', 'qloo_rank', 'qloo_rank']);
   });
 
-  it('keeps at most two calls in flight', async () => {
+  it('keeps one call in flight, or AGORA_QLOO_IN_FLIGHT', async () => {
     const fake = fakeQloo(async (_tool, args) => {
       await new Promise((resolve) => setTimeout(resolve, 5));
       return { results: [{ name: String(args.n) }] };
     });
     setQlooCaller(fake);
     await Promise.all(Array.from({ length: 7 }, (_, n) => callQloo('qloo_recommend', { n })));
-    expect(fake.maxConcurrent).toBe(2);
+    expect(fake.maxConcurrent).toBe(1);
     expect(fake.calls).toHaveLength(7);
     expect(qlooInFlight()).toBe(0);
+
+    process.env.AGORA_QLOO_IN_FLIGHT = '2';
+    try {
+      const two = fakeQloo(async (_tool, args) => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return { results: [{ name: String(args.n) }] };
+      });
+      setQlooCaller(two);
+      await Promise.all(Array.from({ length: 5 }, (_, n) => callQloo('qloo_recommend', { n })));
+      expect(two.maxConcurrent).toBe(2);
+    } finally {
+      delete process.env.AGORA_QLOO_IN_FLIGHT;
+    }
+    expect(qlooInFlight()).toBe(0);
+  });
+
+  it('retries a rate-limited answer twice, then gives up; never a plain error', async () => {
+    setQlooRetryDelays([5, 10]);
+    try {
+      let n = 0;
+      const limited = fakeQloo(() => {
+        n += 1;
+        return n < 3
+          ? { status: 'error', summary: 'Qloo API request failed with 429 Too Many Requests.', error: { code: 'QLOO_RATE_LIMIT', retryable: true } }
+          : { results: [{ name: 'Coco' }] };
+      });
+      setQlooCaller(limited);
+      const ok = await callQloo('qloo_recommend', { n: 'rl' }, 'Mia', Date.now() + 60_000);
+      expect(ok.envelope.status).toBe('ok');
+      expect(ok.record).toMatchObject({ status: 'ok', retries: 2 });
+      expect(limited.calls).toHaveLength(3);
+
+      const always = fakeQloo(() => ({ status: 'error', summary: 'x', error: { code: 'QLOO_RATE_LIMIT', retryable: true } }));
+      setQlooCaller(always);
+      const failed = await callQloo('qloo_recommend', { n: 'always' });
+      expect(failed.envelope.status).toBe('error');
+      expect(failed.record.retries).toBe(2);
+      expect(always.calls).toHaveLength(3);
+
+      const plain = fakeQloo(() => ({ status: 'error', summary: 'bad input', error: { code: 'QLOO_BAD_REQUEST', retryable: false } }));
+      setQlooCaller(plain);
+      const once = await callQloo('qloo_recommend', { n: 'plain' });
+      expect(once.record.retries).toBeUndefined();
+      expect(plain.calls).toHaveLength(1);
+    } finally {
+      setQlooRetryDelays(null);
+    }
+  });
+
+  it('does not wait for a retry that would end past the deadline', async () => {
+    const limited = fakeQloo(() => ({ status: 'error', summary: 'Qloo API request failed with 429.' }));
+    setQlooCaller(limited);
+    const started = Date.now();
+    const result = await callQloo('qloo_rank', { n: 'late' }, 'Dadi', Date.now() + 500);
+    expect(result.envelope.status).toBe('error');
+    expect(limited.calls).toHaveLength(1);
+    expect(Date.now() - started).toBeLessThan(400);
   });
 
   it('turns a throw into an error envelope without leaking the key', async () => {

@@ -55,6 +55,8 @@ export interface QlooCallRecord {
   ms: number;
   /** The member this call was made for, when it was per person. */
   forWho?: string;
+  /** How many times a rate-limited (429) or retryable answer was retried before this one. */
+  retries?: number;
 }
 
 /** Where one option landed for one person. Rank is 1-based within that person's qloo_rank call. */
