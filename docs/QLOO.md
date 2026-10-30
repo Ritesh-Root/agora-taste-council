@@ -6,8 +6,9 @@ How AGORA+ uses Qloo to pick something a whole family will share. This is the te
 | --- | --- |
 | [shared/taste.ts](../shared/taste.ts) | The contract: occasions, members, picks, call records, results. |
 | [server/taste/profile.ts](../server/taste/profile.ts) | Household facts to per-person taste. No model. |
-| [server/taste/qlooClient.ts](../server/taste/qlooClient.ts) | The `qloo mcp` child process, cache, two-slot limit, result normalisation. |
-| [server/taste/council.ts](../server/taste/council.ts) | Candidates, shortlist, ranks, maximin, Keeper, speech. |
+| [server/taste/qlooClient.ts](../server/taste/qlooClient.ts) | The `qloo mcp` child process, cache, one-call-at-a-time limit, 429 retries, result normalisation. |
+| [server/taste/entityMemo.ts](../server/taste/entityMemo.ts) | What each favourite and tag resolved to in Qloo, remembered in `taste-entities.json`. |
+| [server/taste/council.ts](../server/taste/council.ts) | Candidates, place and diet tags, kid-safety filter, shortlist, ranks, maximin, Keeper, speech. |
 | [server/taste/demoSeed.ts](../server/taste/demoSeed.ts) | The fictional demo family. |
 | [server/mcp/server.ts](../server/mcp/server.ts) | The `taste_council` and `taste_profile` MCP tools. |
 | [server/routes.ts](../server/routes.ts) | `GET /api/taste` and `POST /api/taste/council`. |
@@ -44,9 +45,15 @@ Occasions map to one Qloo entity type each:
 
 ### 2. Candidates per person
 
-One `qloo_recommend` call per person, in parallel (but see [the two-slot limit](#caching-and-the-two-in-flight-limit)). Up to 4 loves go in as `signals`, up to 3 tag likes as `signal_tags` with `signal_tags_operator: "union"`, and `limit` is 8.
+One `qloo_recommend` call per person (queued one at a time, see [rate limits](#caching-rate-limits-and-the-entity-memo)). Up to 4 loves go in as `signals`, up to 3 tag likes as `signal_tags` with `signal_tags_operator: "union"`, and `limit` is 8 (12 for films, shows, music and books when someone is under 18, so the adult ones can be left out).
 
 When a location is known (from the request, or `AGORA_TASTE_LOCATION`), the call also carries `signal_location` and the person's age band as a `demographic` phrase. Qloo needs a location alongside a demographic, so without a location no age signal is sent. Places also get `filter_location`, so results are in that area.
+
+**Location is split at the first comma** (`splitLocation`). Qloo matches a location string as one place name: "Bandra, Mumbai" finds nothing, while "Bandra" and "Mumbai" both work. So "Bandra, Mumbai" filters places to `Bandra` and sends `Mumbai` as the audience `signal_location`. A single name such as "Mumbai" is used for both.
+
+**Places get a kind.** Dinner out sends `include_tags: ["urn:tag:genre:place:restaurant"]`, Qloo's restaurant genre. An outing sends ten place categories (museum, park, amusement park, tourist attraction, zoo, aquarium, science museum, water park, theme park, botanical garden) with `include_tags_operator: "union"`, and excludes the restaurant genre.
+
+**Diet is a Qloo signal at dinner.** A person whose constraints include `vegetarian`, `jain` or `vegan` gets Qloo's place offering tag in their own calls, and nobody else's: `urn:tag:offerings:place:vegetarian_options` (vegetarian and jain) or `urn:tag:offerings:place:vegan_options` (vegan). In `qloo_recommend` it joins the restaurant genre with `include_tags_operator: "intersection"`, so that person's candidates are restaurants Qloo lists with those options. The tags were found with `qloo tags --type offerings:place`; they are sent as URNs, so they never need resolving. Qloo's "Jain vegetarian food" tag exists but is rare, so jain uses the vegetarian tag. Halal, kosher and the other diets have no verified tag and are left to Keeper.
 
 | Age band | Phrase sent to Qloo |
 | --- | --- |
@@ -59,6 +66,8 @@ When a location is known (from the request, or `AGORA_TASTE_LOCATION`), the call
 
 An avoid fact ("no horror") becomes `exclude_tags` for films, shows, music and books. It is not sent for places. A person with no loves, no tag likes, and no location is not asked.
 
+**Children.** When anyone in the council is under 18, films, shows, artists and books Qloo rates for adults (R, NC-17, TV-MA, A, 18 and similar), or with a profane or explicit title or description, are left out before the shortlist. The result's note says how many and why, for example "Left out 12 suggestions rated for adults or with an explicit title, because Mia and Rohan are under 18." Places are not filtered this way.
+
 ### 3. One shared shortlist
 
 Each person's candidates are interleaved round-robin (first from each person, then second from each person, and so on) and deduplicated by Qloo entity id, then by name. The list stops at 10 options, because `qloo_rank` accepts at most 10. Round-robin means the shortlist is not dominated by whoever had the most results.
@@ -66,6 +75,8 @@ Each person's candidates are interleaved round-robin (first from each person, th
 ### 4. Rank the same list for each person
 
 One `qloo_rank` call per person, with the same `options` (the Qloo entity ids), `option_type`, and that person's `signals`, `signal_location` and `demographic`. `qloo_rank` has no tag-signal field, so tag likes are not used here.
+
+At dinner, a vegetarian, jain or vegan person's rank also carries the diet tag as `include_tags`. Qloo then ranks only the options it lists with those options, and the rest count as last for that person (shown as "Not ranked"). The note says so: "Arjun's ranks count only places Qloo lists with vegetarian options; the others rank last for Arjun." If no option on the shortlist has the tag, the rank is asked again without it, and the note says the person's ranks ignore diet.
 
 Qloo's own tool description says scores from separate calls are not comparable. So the council throws scores away and keeps only each person's order: their 1st, 2nd, ... 10th.
 
@@ -80,16 +91,16 @@ For each option: `worstRank` is the highest (worst) rank any person gave it, and
 
 ### 6. Keeper
 
-Keeper is code here, not a model. It reads each candidate's name, Qloo tags, subtitle and description, and removes the candidate if it mentions a word that clashes with someone's constraint:
+Keeper is code here, not a model: a keyword check. It reads each candidate's name, Qloo tags, subtitle and description (for places the harness returns a description, not Qloo's full tag list), and removes the candidate if it mentions a word that clashes with someone's constraint:
 
 - `no X` applies to every occasion: "no horror" removes anything mentioning horror.
-- Diets and allergies apply to places only. `vegetarian` watches for words such as steakhouse, bbq, barbecue, meat, butcher, churrascaria. A peanut allergy watches for peanut, satay, groundnut. The full lists are `DIET_WORDS` and `ALLERGEN_WORDS` in [council.ts](../server/taste/council.ts).
+- Diets and allergies apply to places only. `vegetarian`, `jain` and `vegan` watch for clearly meat-centric words: steakhouse, bbq, barbecue, meat, butcher, churrascaria, grill house, kebab, seafood, fried chicken, mutton and similar. In the place's name only, chicken, fish, prawn, crab and lobster also count ("Chicken Story" is vetoed; a menu with butter chicken is not). The list is narrow on purpose: vegetarians eat at mixed restaurants, and "halal" alone is not a veto (Qloo describes a Pan-Asian place in Khar as having "Halal-friendly vegetarian options"). A peanut allergy watches for peanut, satay, groundnut. The full lists are `MEAT_PLACE_WORDS`, `DIET_WORDS`, `DIET_NAME_WORDS` and `ALLERGEN_WORDS` in [council.ts](../server/taste/council.ts).
 
 Each veto records the option, the person, and the quoted fact. The first veto is added to the spoken sentence.
 
 ### 7. Speech and receipts
 
-The spoken sentence is built from the winner's ranks, by code. For example: "For movie night, X works for everyone: it ranks in the top 3 for Arjun, Dadi, Mia and Rohan." The result also carries every Qloo call (tool, arguments, status, summary, result count, ms, and who it was for), a status (`ok`, `degraded`, `error`), and a note when something was missing. The last 5 results are saved to `taste-recent.json` under `AGORA_DATA_DIR`. A "Qloo is not set up" error is not saved, so it cannot fill the list.
+The spoken sentence is built from the winner's ranks, by code. For example: "For movie night, X works for everyone: it ranks in the top 3 for Arjun, Dadi, Mia and Rohan." It names only the people Qloo actually ranked the winner for; anyone whose rank is missing is named separately ("Qloo has no rank from Dadi for it"), and "everyone" is said only when nobody is missing. When no rank call answered, it says the pick follows Qloo's suggestions and claims no ranks. A long subtitled title is spoken by its main part ("I Am Malala"). The result also carries every Qloo call (tool, arguments, status, summary, result count, ms, and who it was for), a status (`ok`, `degraded`, `error`), and a note when something was missing. The last 5 results are saved to `taste-recent.json` under `AGORA_DATA_DIR`. A "Qloo is not set up" error is not saved, so it cannot fill the list.
 
 ## Worked example: the demo family
 
@@ -135,7 +146,20 @@ The ranks below are made up to show the arithmetic. They are not a recorded Qloo
 - Spoken: "For movie night, B works for everyone: it ranks in the top 3 for Arjun, Dadi, Mia and Rohan."
 - Nobody in the demo family has a "no X" fact, so Keeper vetoes nothing for films.
 
-**Dinner out, location Bengaluru.** The same steps with `target_type: "place"` and `filter_location`. If a candidate's name, tags or description mention "steakhouse" or "bbq", Keeper removes it and quotes "Arjun is vegetarian". If one mentions "satay" or "peanut", it quotes "Mia is allergic to peanuts". The spoken sentence then ends with, for example, "Keeper set aside X because Arjun is vegetarian."
+**Dinner out, location "Bandra, Mumbai".** The same steps with `target_type: "place"`, `filter_location: "Bandra"`, `signal_location: "Mumbai"` and the restaurant genre. Arjun's two calls also carry the vegetarian offering tag. If a candidate's name or description is clearly meat-centric ("kebab", "steakhouse", "fried chicken"), Keeper removes it and quotes "Arjun is vegetarian". If one mentions "satay" or "peanut", it quotes "Mia is allergic to peanuts". The spoken sentence then ends with, for example, "Keeper set aside X because Arjun is vegetarian."
+
+Measured locally against the hackathon endpoint on 31 Oct 2026 (`AGORA_DEMO_SEED=1`, 8 calls each, 0 `needs_input`), before and after the diet signal:
+
+| | Pick | Arjun | Dadi | Mia | Rohan | Keeper |
+| --- | --- | --- | --- | --- | --- | --- |
+| Before | 1. Hotel Shahnaz | 7 | 2 | 5 | 5 | nothing removed |
+| | 2. Oriental Residency | 5 | 8 | 4 | 2 | |
+| | 3. Mad Over Donuts | 8 | 7 | 1 | 4 | |
+| After | 1. Caravan Serai Bandra | 5 | 5 | 3 | 1 | removed IMBISS Meating Joint and KFC: "Arjun is vegetarian" |
+| | 2. Me Time Art Cafe | 1 | 4 | 8 | 9 | |
+| | 3. Mad Over Donuts | not ranked | 7 | 1 | 5 | |
+
+Hotel Shahnaz (Qloo: "Casual Indian eatery known for halal dishes and small plates", specialty kheema pav) is not vetoed by Keeper, because that description does not say meat outright. It drops to 4th because Qloo does not list it with vegetarian options, so it ranks last for Arjun. Ranks are of 10; Arjun's diet-filtered rank returned 6 of the 10.
 
 ## Request to result, redacted
 
@@ -155,20 +179,24 @@ These are the shapes the council sends to `qloo mcp`, taken from [council.ts](..
 }
 ```
 
-`qloo_recommend` for Rohan, dinner out, location Bengaluru:
+`qloo_recommend` for Arjun, dinner out, location "Bandra, Mumbai" (names shown before the entity memo swaps in their Qloo ids):
 
 ```json
 {
   "target_type": "place",
   "limit": 8,
-  "signals": ["Spider-Man: Into the Spider-Verse", "Arijit Singh"],
-  "signal_location": "Bengaluru",
-  "demographic": "teens",
-  "signal_tags": ["street food"],
-  "signal_tags_operator": "union",
-  "filter_location": "Bengaluru"
+  "signals": ["A. R. Rahman", "Interstellar"],
+  "signal_location": "Mumbai",
+  "demographic": "adults 35-44",
+  "filter_location": "Bandra",
+  "include_tags": ["urn:tag:genre:place:restaurant", "urn:tag:offerings:place:vegetarian_options"],
+  "include_tags_operator": "intersection",
+  "signal_tags": ["thrillers"],
+  "signal_tags_operator": "union"
 }
 ```
+
+Rohan's dinner call is the same shape with his signals, `"demographic": "teens"`, `"signal_tags": ["street food"]`, and only the restaurant genre in `include_tags`.
 
 `qloo_rank` for Dadi, movie night, over the shared shortlist:
 
@@ -230,22 +258,25 @@ When the harness cannot resolve an input to one entity, it returns `status: "nee
 }
 ```
 
-One unresolved input fails the whole call, so the council repairs it and retries once (`repairArgs` and `callWithRepair` in [council.ts](../server/taste/council.ts)):
+One unresolved input fails the whole call. The harness searches names without a type, so almost every name is ambiguous ("Coco" is a film and three albums). The council resolves each name once and remembers it ([entityMemo.ts](../server/taste/entityMemo.ts)):
 
-- In `signals`, `signal_tags`, `include_tags` and `exclude_tags`, the ambiguous value is replaced with Qloo's first candidate id. A value with no candidate is dropped.
-- In `options`, an ambiguous option is dropped.
-- If the summary mentions the demographic, the demographic is dropped.
-- A `qloo_recommend` call left with no signal, tag, demographic or location is not retried.
+- **Choosing.** For a signal, `chooseEntity` prefers a work or artist over a person, an author, a brand, a place or an album; one Qloo describes over a bare record; an exact name over a near one; then Qloo's order. A locality is never a taste signal. For a tag, the harness already scopes the search to the target type, and Qloo's first candidate is taken. A name with no candidate is remembered as dropped.
+- **Remembering.** Every answer teaches the memo: ids the harness resolved in an `ok` result, and the choice made for each `needs_input` issue. From then on the Qloo id is sent instead of the name: in the retry, in that person's `qloo_rank`, and in every later council. The memo is saved to `taste-entities.json` under `AGORA_DATA_DIR` (up to 500 entries), keyed by name for signals and by target type and name for tags.
+- **Demo seed.** With `AGORA_DEMO_SEED=1`, the demo family's favourites and tags start out resolved (as they resolved live on 31 Oct 2026), so a fresh deploy's first council does not pay the `needs_input` round trip. A saved `taste-entities.json` overrides the seed. The place and diet tags are sent as URNs and never need resolving.
+- **Repair.** On `needs_input`, the call is retried once with the remembered ids (`repairArgs` and `callWithRepair` in [council.ts](../server/taste/council.ts)). An ambiguous option is dropped. If the summary mentions the demographic, the demographic is dropped. A `qloo_recommend` call left with no signal, tag, demographic or location is not retried.
 
-Both the first call and the retry appear in the call list. A repaired `needs_input` is not counted as a failure.
+Both the first call and the retry appear in the call list. A repaired `needs_input` is not counted as a failure. In the live runs below, with the seed, no call answered `needs_input`.
 
-## Caching and the two-in-flight limit
+## Caching, rate limits and the entity memo
 
 From [qlooClient.ts](../server/taste/qlooClient.ts):
 
 - **One child process.** `qloo mcp` (or `QLOO_BIN mcp`) starts on first use and is reused. If it dies, the next call starts a new one, once.
 - **Cache.** Results with status `ok` or `empty` are cached for 30 minutes, keyed by tool name and arguments, up to 200 entries. Asking the same council again within 30 minutes makes no new Qloo calls.
-- **Two in flight.** At most two Qloo calls run at once. The rest wait. A four-person council makes 8 calls without bursting the hackathon quota.
+- **One in flight.** By default one Qloo call runs at a time and the rest wait (`AGORA_QLOO_IN_FLIGHT`, 1 to 4). The harness resolves the names and ids in one call with its own parallel requests, so one call is already a small burst; a four-person council's 8 calls go one after another.
+- **429 retries.** A rate-limited (429) or other retryable answer is retried twice, 1.5 s and then 4 s later, holding the slot so the queued calls back off too. A retry is made only if its wait ends before the council's deadline.
+- **Council deadline.** 40 seconds. Past it, queued calls are skipped and the council answers with what it has, marked `degraded`, with the note "The council ran out of time, so some Qloo calls were skipped." A call that started just before can still take its own 20 s, which keeps the whole under the page's 60 s.
+- **Entity memo.** Names resolve once, then travel as Qloo ids. See [Ambiguity](#ambiguity-needs_input).
 - **Timeouts.** 20 seconds per call, 8 seconds for start-up and the readiness check.
 - **Readiness.** Before each council, `qloo_capabilities` checks that the child started and its adapter is ready. The harness answers it without contacting Qloo. Not ready means a clear message ("Qloo is not set up on this server yet. Run qloo setup or set QLOO_API_KEY, then ask again.") and no Qloo calls.
 - **Errors never throw.** A failed call becomes an `error` envelope. Error text is cut to 200 characters, and the value of `QLOO_API_KEY` is replaced with `[redacted]` if it ever appears.
@@ -260,7 +291,8 @@ From [qlooClient.ts](../server/taste/qlooClient.ts):
 | `QLOO_HOME` | `qloo mcp` | Harness state directory. Default `~/.qloo`. The Dockerfile sets `/tmp/qloo`. |
 | `QLOO_BIN` | AGORA+ | Path to the `qloo` command. Default `qloo`. |
 | `AGORA_TASTE_LOCATION` | AGORA+ | Default location when a request has none. Enables age-band demographics and filters places. |
-| `AGORA_DEMO_SEED` | AGORA+ | `1` writes the fictional family into empty memory at startup. |
+| `AGORA_DEMO_SEED` | AGORA+ | `1` writes the fictional family into empty memory at startup, and starts the entity memo with the family's resolved Qloo ids. |
+| `AGORA_QLOO_IN_FLIGHT` | AGORA+ | Qloo calls in flight at once, 1 to 4. Default 1. |
 | `AGORA_SERVER_LLM` | AGORA+ | `vertex` for Gemini on Vertex AI. Also `bedrock` or `openai`. |
 | `GOOGLE_CLOUD_PROJECT` | AGORA+ | Google Cloud project for Vertex AI. `GCLOUD_PROJECT` also works. |
 | `VERTEX_LOCATION` | AGORA+ | Vertex region. Default `global`. |
@@ -370,25 +402,41 @@ Notes:
 - `--allow-unauthenticated` makes the URL reachable; the household passcode still guards the household routes.
 - Confirm flag names with `gcloud run deploy --help` for your gcloud version.
 
+## Live results
+
+Measured on the deployed Cloud Run revision `agora-plus-00003` on 31 Oct 2026, around 03:45 IST, with the fictional demo family and the hackathon endpoint. The dinner row is from before the diet signal above. Ranks are Arjun / Dadi / Mia / Rohan, each out of the shortlist (at most 10).
+
+| Occasion | Location | Pick | Arjun | Dadi | Mia | Rohan | Note |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `movie_night` | not given (server default) | 102 Not Out | 4 | 1 | 5 | 5 | |
+| `dinner_out` | Bandra, Mumbai | Hotel Shahnaz | 7 | 2 | 5 | 5 | before the diet signal |
+| `playlist` | not given (server default) | Parvaaz | 1 | 4 | 5 | 2 | |
+| `tv_show` | not given (server default) | Loki | 4 | 4 | 4 | 3 | 12 adult-rated suggestions left out |
+| `book_club` | not given (server default) | I Am Malala | 4 | 6 | 4 | 1 | |
+| `outing` | Mumbai | Mahakali Caves | 6 | 6 | 2 | 2 | |
+
+Every council answered `ok` with 8 Qloo calls and no `needs_input`. Each took 1.5 to 3 seconds warm; the first, cold call took 18 seconds. These are one run each, not an average.
+
 ## Known limitations
 
 What a council result does not establish:
 
 - **Enjoyment.** A rank is where Qloo placed an option among at most 10, for a profile built from a few saved favourites. It is an aggregate affinity, not a prediction about the person.
 - **Global quality.** The pick is the fairest option within the shortlist, not the best film or restaurant available.
-- **Age suitability.** No content-rating filter is applied. The rating shows when Qloo returns one. Check it before a child watches.
-- **Allergy or diet safety.** Keeper is a keyword check on names, tags and descriptions. A restaurant that serves peanuts but never says so in Qloo's metadata will pass. Check the menu.
+- **Age suitability.** With someone under 18, only adult ratings (R, NC-17, TV-MA, A, 18) and explicit titles are left out. Only an age band is known, not an age, so TV-14 and PG-13 still pass for a 9-year-old. Books have no rating in Qloo, so only an explicit title or description keeps a book out. The rating shows when Qloo returns one. Check it before a child watches.
+- **Allergy or diet safety.** Keeper is a keyword check on names, tags and descriptions. A restaurant that serves peanuts, or is meat-centric, but never says so in Qloo's metadata will pass (Hotel Shahnaz's description says "halal dishes", not meat). The diet tag only reflects whether Qloo lists vegetarian or vegan options. Check the menu.
 - **Equal strength across people.** "#2 for Mia" and "#2 for Dadi" are positions, not comparable scores.
 
 Other limits:
 
 - **Children.** There is no "children" demographic. Under-18 is sent as "teens", which the harness maps to its youngest age bucket (24 and younger). Mia (9) and Rohan (16) get the same age signal.
 - **Location gates demographics.** Without a location, no age signal is sent, and places may be far away.
+- **Location parts.** Only the first comma part filters places ("Bandra, Mumbai" filters to Bandra) and only the second is the audience signal; any further parts are ignored. A neighbourhood name Qloo does not know returns nothing.
 - **Tags do not rank.** `qloo_rank` takes no tag signals. A person with only tag likes and no location is not ranked.
-- **First candidate on ambiguity.** On `needs_input` the council takes Qloo's first candidate without asking. It can be the wrong match.
+- **Chosen, not asked, on ambiguity.** On `needs_input` the council chooses a candidate by type and description (a film or artist over an album of the same name) without asking, and remembers it. It can still be the wrong match, and it stays wrong until `taste-entities.json` is edited or deleted. Tags take Qloo's first candidate.
 - **Parser coverage.** The fact parser is English patterns. "Mia's been really into Bluey lately" is not understood. `taste_profile` shows what was parsed.
 - **Fairness rule.** Maximin protects the least happy person. It can pass over an option most people rank first.
 - **Shortlist size.** 10 options, from at most 8 candidates per person.
 - **Cache.** For 30 minutes, the same question returns the same Qloo results.
-- **Scale.** One household per server, one Qloo child process, two calls at a time. A council's time grows with the number of people. The MCP tool tells clients to expect 5 to 20 seconds; that range was not measured here.
-- **No live run is recorded in this repository.** Unit and browser tests use a scripted Qloo stand-in and a mocked API.
+- **Scale.** One household per server, one Qloo child process, one call at a time by default. A council's time grows with the number of people. The MCP tool tells clients to expect 5 to 20 seconds; the live runs above took 1.5 to 3 seconds warm and 18 seconds cold.
+- **Live evidence is small.** The live results above are one run per occasion for one fictional family. Unit and browser tests use a scripted Qloo stand-in and a mocked API.

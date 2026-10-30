@@ -339,6 +339,63 @@ describe('runCouncil', () => {
     expect(result.speech).toMatch(/Keeper set aside Smoky BBQ Steakhouse because Rohan is vegetarian\./);
   });
 
+  it('sends a vegetarian\'s diet as a Qloo tag in their own dinner calls only, so untagged places rank last for them', async () => {
+    const place = (id: string, name: string) => ({ ...entity(id, name), type: 'urn:entity:place' });
+    const halal = place('h', 'Hotel Halal Plates');
+    const cafe = place('c', 'Green Cafe');
+    const dosa = place('d', 'Dosa Corner');
+    const VEG = 'urn:tag:offerings:place:vegetarian_options';
+    const fake = fakeQloo((tool, args) => {
+      if (tool === 'qloo_recommend') return { results: [halal, cafe, dosa] };
+      const options = args.options as string[];
+      // Qloo keeps only the options that list the include tag.
+      const listed = Array.isArray(args.include_tags) ? [cafe, dosa] : [halal, dosa, cafe];
+      return { results: listed.filter((item) => options.includes(item.entity_id as string)) };
+    });
+    setQlooCaller(fake);
+    const profile = profileFromEntries(facts('Arjun loves Interstellar', 'Arjun is vegetarian', 'Dadi loves Raj Kapoor films'));
+    const result = await runCouncil({ occasion: 'dinner_out', location: 'Bandra, Mumbai' }, { profile });
+
+    const recommend = (who: string) => fake.calls.find((call) => call.tool === 'qloo_recommend' && firstSignal(call.args) === who)?.args;
+    const rank = (who: string) => fake.calls.find((call) => call.tool === 'qloo_rank' && firstSignal(call.args) === who)?.args;
+    expect(recommend('Interstellar')).toMatchObject({ include_tags: ['urn:tag:genre:place:restaurant', VEG], include_tags_operator: 'intersection' });
+    expect(recommend('Raj Kapoor')?.include_tags).toEqual(['urn:tag:genre:place:restaurant']);
+    expect(recommend('Raj Kapoor')?.include_tags_operator).toBeUndefined();
+    expect(rank('Interstellar')?.include_tags).toEqual([VEG]);
+    expect(rank('Raj Kapoor')?.include_tags).toBeUndefined();
+
+    // Dadi ranks the halal place first, but it is missing from Arjun's diet-filtered rank: last for him.
+    const halalPick = result.picks.find((pick) => pick.name === 'Hotel Halal Plates');
+    expect(halalPick?.fits.find((fit) => fit.who === 'Arjun')?.rank).toBeNull();
+    expect(halalPick?.worstRank).toBe(3);
+    expect(result.picks[0].name).toBe('Dosa Corner');
+    expect(result.vetoes).toEqual([]);
+    expect(result.status).toBe('ok');
+    expect(result.note).toMatch(/Arjun's ranks count only places Qloo lists with vegetarian options/);
+
+    // Films are not filtered by diet.
+    fake.calls.length = 0;
+    await runCouncil({ occasion: 'movie_night', location: 'Mumbai' }, { profile });
+    expect(fake.calls.every((call) => !call.args.include_tags)).toBe(true);
+  });
+
+  it('ranks without the diet tag when no option lists it, and says so', async () => {
+    const place = (id: string, name: string) => ({ ...entity(id, name), type: 'urn:entity:place' });
+    const options = [place('a', 'Bombay Canteen'), place('b', 'Pali Village Cafe')];
+    const fake = fakeQloo((tool, args) => {
+      if (tool === 'qloo_recommend') return { results: options };
+      return Array.isArray(args.include_tags) ? { status: 'empty', results: [] } : { results: options };
+    });
+    setQlooCaller(fake);
+    const profile = profileFromEntries(facts('Arjun loves Interstellar', 'Arjun is a vegan'));
+    const result = await runCouncil({ occasion: 'dinner_out', location: 'Mumbai' }, { profile });
+    const ranks = fake.calls.filter((call) => call.tool === 'qloo_rank');
+    expect(ranks.map((call) => call.args.include_tags)).toEqual([['urn:tag:offerings:place:vegan_options'], undefined]);
+    expect(result.picks[0].fits[0].rank).toBe(1);
+    expect(result.status).toBe('ok');
+    expect(result.note).toMatch(/Qloo lists none of these places with vegan options, so Arjun's ranks ignore diet\./);
+  });
+
   it('keeps the last results across a reload, newest first, errors left out', async () => {
     setQlooCaller(family());
     await runCouncil({ occasion: 'movie_night' }, { profile: FAMILY });
@@ -445,6 +502,27 @@ describe('maximin helpers', () => {
     expect(conflictWords('vegetarian', 'place')).toContain('steakhouse');
     expect(conflictWords('peanuts', 'place')).toContain('satay');
     expect(conflictWords('no horror', 'movie')).toEqual(['horror']);
+  });
+
+  it('vetoes clearly meat-centric places for a vegetarian, not mixed restaurants', () => {
+    const place = (id: string, name: string, description?: string) => candidateFrom(entity(id, name, description ? { description } : {}))!;
+    const shortlist = scoreShortlist([
+      place('1', 'Bade Miya', 'Late-night stall known for seekh kebabs and rolls.'),
+      place('2', 'Chicken Story'),
+      place('3', 'Gajalee', 'Coastal seafood restaurant serving Malvani curries.'),
+      place('4', 'Punjab Grill House'),
+      place('5', 'Copper Chimney', 'North Indian restaurant serving butter chicken, dal makhani and paneer tikka.'),
+      place('6', 'Khow Chow', 'Upscale Pan-Asian spot offering small plates and Halal-friendly vegetarian options.'),
+      place('7', 'Hotel Shahnaz', 'Casual Indian eatery known for halal dishes and small plates.'),
+      place('8', 'Goldfish Bistro'),
+    ], []);
+    const profile = profileFromEntries(facts('Arjun is vegetarian'));
+    const { kept, vetoes } = keeperCheck(shortlist, profile.members, 'place', profile.constraintFacts);
+    expect(vetoes.map((veto) => veto.name)).toEqual(['Bade Miya', 'Chicken Story', 'Gajalee', 'Punjab Grill House']);
+    expect(vetoes.every((veto) => veto.fact === 'Arjun is vegetarian')).toBe(true);
+    expect(kept.map((item) => item.name)).toEqual(['Copper Chimney', 'Khow Chow', 'Hotel Shahnaz', 'Goldfish Bistro']);
+    // Name-only words never apply to films.
+    expect(keeperCheck(scoreShortlist([place('9', 'Chicken Run')], []), profile.members, 'movie', profile.constraintFacts).vetoes).toEqual([]);
   });
 
   it('does not turn a diet with no place words into a word to veto', () => {

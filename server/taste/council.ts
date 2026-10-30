@@ -66,6 +66,35 @@ export function demographicFor(member: TasteMember): string | undefined {
 
 /** Qloo's restaurant genre: dinner out returns places to eat. */
 const DINNER_TAGS = ['urn:tag:genre:place:restaurant'];
+/**
+ * Qloo's place offerings for a diet (found with `qloo tags --query vegetarian --type offerings:place`).
+ * For dinner out, a person with one of these diets gets the tag in their own calls: qloo_recommend
+ * asks for restaurants that also list it, and qloo_rank keeps only options that list it, so the rest
+ * rank last for that person. Jain uses the vegetarian tag: Qloo's "Jain vegetarian food" is rare and
+ * would leave too few places. Halal, kosher and the rest have no verified tag; only Keeper checks them.
+ */
+export const DIET_PLACE_TAGS: Readonly<Record<string, { tag: string; offering: string }>> = {
+  vegetarian: { tag: 'urn:tag:offerings:place:vegetarian_options', offering: 'vegetarian' },
+  jain: { tag: 'urn:tag:offerings:place:vegetarian_options', offering: 'vegetarian' },
+  vegan: { tag: 'urn:tag:offerings:place:vegan_options', offering: 'vegan' },
+};
+
+/**
+ * The Qloo tags for one person's diets at dinner, and the offerings they name ("vegetarian").
+ * Empty for other occasions.
+ */
+export function dietSignal(member: TasteMember, occasion: TasteOccasion): { diets: string[]; tags: string[] } {
+  const diets: string[] = [];
+  const tags: string[] = [];
+  if (occasion !== 'dinner_out') return { diets, tags };
+  for (const constraint of member.constraints) {
+    const known = DIET_PLACE_TAGS[constraint.toLowerCase().trim()];
+    if (!known || tags.includes(known.tag)) continue;
+    tags.push(known.tag);
+    diets.push(known.offering);
+  }
+  return { diets, tags };
+}
 /** Qloo place categories for a family day out (qloo_recommend takes at most 10 include tags). */
 const OUTING_TAGS = [
   'urn:tag:category:place:museum',
@@ -235,6 +264,9 @@ export interface MemberRanking {
   order: string[] | null;
   /** True when the person had nothing Qloo can rank with (no named favourite, no location). */
   skipped?: boolean;
+  /** Offerings ("vegetarian") sent as Qloo tags in this rank. `dietIgnored`: no option had them, so it was ranked without. */
+  diets?: string[];
+  dietIgnored?: boolean;
 }
 
 interface Scored extends Candidate {
@@ -273,13 +305,31 @@ export function scoreShortlist(shortlist: Candidate[], rankings: MemberRanking[]
 
 // ---- Keeper ----
 
+/**
+ * Words in a place's name, tags or description that make it meat-centric. Kept narrow on purpose:
+ * vegetarians eat at mixed restaurants, so "butter chicken" or "halal" in a description is not a veto.
+ */
+const MEAT_PLACE_WORDS = [
+  'steakhouse', 'steak house', 'steak', 'bbq', 'barbecue', 'barbeque', 'meat', 'butcher', 'churrascaria',
+  'smokehouse', 'chophouse', 'rodizio', 'brazilian grill', 'grill house', 'grillhouse', 'kebab', 'kabab',
+  'seafood', 'fried chicken', 'mutton',
+];
+
 const DIET_WORDS: Record<string, string[]> = {
-  vegetarian: ['steakhouse', 'steak house', 'steak', 'bbq', 'barbecue', 'barbeque', 'meat', 'butcher', 'churrascaria', 'smokehouse', 'chophouse', 'rodizio', 'brazilian grill'],
-  vegan: ['steakhouse', 'steak house', 'steak', 'bbq', 'barbecue', 'barbeque', 'meat', 'butcher', 'churrascaria', 'smokehouse', 'chophouse', 'cheese', 'dairy', 'creamery', 'ice cream'],
+  vegetarian: MEAT_PLACE_WORDS,
+  vegan: [...MEAT_PLACE_WORDS, 'cheese', 'dairy', 'creamery', 'ice cream'],
   pescatarian: ['steakhouse', 'steak house', 'steak', 'bbq', 'barbecue', 'barbeque', 'butcher', 'churrascaria', 'chophouse'],
   halal: ['pork', 'bacon', 'ham', 'brewery', 'brewpub'],
-  jain: ['steakhouse', 'steak', 'bbq', 'barbecue', 'meat'],
+  jain: MEAT_PLACE_WORDS,
   teetotal: ['brewery', 'brewpub', 'wine bar', 'pub', 'cocktail bar'],
+};
+
+/** Checked in the place's name only: "Chicken Story" is a chicken place, a menu that has chicken is not. */
+const MEAT_NAME_WORDS = ['chicken', 'fish', 'prawn', 'crab', 'lobster'];
+const DIET_NAME_WORDS: Record<string, string[]> = {
+  vegetarian: MEAT_NAME_WORDS,
+  vegan: MEAT_NAME_WORDS,
+  jain: MEAT_NAME_WORDS,
 };
 
 const ALLERGEN_WORDS: Record<string, string[]> = {
@@ -327,6 +377,12 @@ export function conflictWords(constraint: string, target: string): string[] {
   return [singular(value)].filter((word) => word.length > 2);
 }
 
+/** Words that conflict with a diet when they appear in a place's name. */
+export function nameConflictWords(constraint: string, target: string): string[] {
+  if (target !== 'place') return [];
+  return DIET_NAME_WORDS[constraint.toLowerCase().trim()] ?? [];
+}
+
 export function keeperCheck(
   candidates: Scored[],
   members: TasteMember[],
@@ -339,7 +395,10 @@ export function keeperCheck(
     let veto: KeeperVeto | null = null;
     for (const member of members) {
       for (const constraint of member.constraints) {
-        if (!conflictWords(constraint, target).some((word) => mentions(candidate.text, word))) continue;
+        const name = candidate.name.toLowerCase();
+        const clash = conflictWords(constraint, target).some((word) => mentions(candidate.text, word))
+          || nameConflictWords(constraint, target).some((word) => mentions(name, word));
+        if (!clash) continue;
         const fact = constraintFacts.get(`${member.who.toLowerCase()}|${constraint.toLowerCase()}`) ?? `${member.who}: ${constraint}`;
         veto = { name: candidate.name, fact, who: member.who };
         break;
@@ -561,14 +620,18 @@ function sharedSignals(member: TasteMember, location: string | undefined, target
   return args;
 }
 
-/** What qloo_recommend gets beyond the shared signals: place kind and area, and a bigger list for a child. */
-function recommendFilters(occasion: TasteOccasion, location: string | undefined, withChild: boolean): Record<string, unknown> {
+/**
+ * What qloo_recommend gets beyond the shared signals: place kind and area, the person's diet for
+ * dinner (restaurant AND the diet's offering), and a bigger list for a child.
+ */
+function recommendFilters(occasion: TasteOccasion, location: string | undefined, withChild: boolean, dietTags: string[] = []): Record<string, unknown> {
   const target = OCCASION_TARGET[occasion];
   const args: Record<string, unknown> = {};
   if (target === 'place') {
     if (location) args.filter_location = splitLocation(location).filter;
     if (occasion === 'dinner_out') {
-      args.include_tags = DINNER_TAGS;
+      args.include_tags = [...DINNER_TAGS, ...dietTags];
+      if (dietTags.length > 0) args.include_tags_operator = 'intersection';
     } else {
       args.include_tags = OUTING_TAGS;
       args.include_tags_operator = 'union';
@@ -674,7 +737,7 @@ export async function runCouncil(
       target_type: target,
       limit: RECOMMEND_LIMIT,
       ...sharedSignals(member, location, target),
-      ...recommendFilters(occasion, location, childSafe),
+      ...recommendFilters(occasion, location, childSafe, dietSignal(member, occasion).tags),
     };
     const tags = cleanList(member.likesTags, MAX_TAGS);
     if (tags.length > 0) {
@@ -740,8 +803,18 @@ export async function runCouncil(
     const because = cleanList(member.loves, MAX_SIGNALS);
     const args: Record<string, unknown> = { options, option_type: target, ...sharedSignals(member, location, target) };
     if (!args.signals && !args.signal_location) return { who: member.who, because, order: null, skipped: true };
-    const { envelope } = await callWithRepair('qloo_rank', args, member.who, calls, budget);
-    if (!usable(envelope.status) || envelope.results.length === 0) return { who: member.who, because, order: null };
+    // A diet keeps only options Qloo lists with it; the others count as last for this person.
+    const diet = dietSignal(member, occasion);
+    const withDiet = diet.tags.length > 0 ? { ...args, include_tags: diet.tags } : args;
+    let { envelope } = await callWithRepair('qloo_rank', withDiet, member.who, calls, budget);
+    let dietIgnored = false;
+    if (diet.tags.length > 0 && usable(envelope.status) && envelope.results.length === 0) {
+      // No option lists the diet: rank them all without it rather than not at all.
+      ({ envelope } = await callWithRepair('qloo_rank', args, member.who, calls, budget));
+      dietIgnored = true;
+    }
+    const dietInfo = diet.diets.length > 0 ? { diets: diet.diets, ...(dietIgnored ? { dietIgnored } : {}) } : {};
+    if (!usable(envelope.status) || envelope.results.length === 0) return { who: member.who, because, order: null, ...dietInfo };
     const order: string[] = [];
     for (const raw of envelope.results) {
       const item = asRecord(raw);
@@ -751,7 +824,7 @@ export async function runCouncil(
       const key = (id && byId.get(id)) ?? (name && byName.get(name));
       if (key && !order.includes(key)) order.push(key);
     }
-    return { who: member.who, because, order: order.length > 0 ? order : null };
+    return { who: member.who, because, order: order.length > 0 ? order : null, ...dietInfo };
   }));
 
   // If no ranking came back at all, fall back to each person's recommend order.
@@ -780,6 +853,13 @@ export async function runCouncil(
   if (recommendFailed.length > 0) notes.push(`Qloo suggested nothing for ${listNames(recommendFailed)}, so the shortlist comes from the others.`);
   const skipped = rankings.filter((ranking) => ranking.skipped).map((ranking) => ranking.who);
   if (skipped.length > 0) notes.push(`${listNames(skipped)} named no favourite title or artist, so Qloo could not rank for them.`);
+  for (const ranking of rankings) {
+    if (!ranking.diets || !ranking.order) continue;
+    const diets = listNames(ranking.diets);
+    notes.push(ranking.dietIgnored
+      ? `Qloo lists none of these places with ${diets} options, so ${ranking.who}'s ranks ignore diet.`
+      : `${ranking.who}'s ranks count only places Qloo lists with ${diets} options; the others rank last for ${ranking.who}.`);
+  }
   if (childNote) notes.push(childNote);
   if (missing.length > 0) notes.push(`No taste facts for ${listNames(missing)}.`);
   if (target === 'place' && !location) notes.push('No location was given, so places may be far away.');

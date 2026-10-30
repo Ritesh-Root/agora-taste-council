@@ -23,7 +23,7 @@ On the live demo (a fictional family: Mia 9, Rohan 16, Arjun 41, Dadi 74):
 3. Leave everyone in, choose **Family movie night**, and press **Ask the council**.
 4. The result sheet shows the pick, each person's rank for it ("#2 of 10"), who it suits least ("Lowest fit"), Qloo's tags, and the runners-up.
 5. Open **Qloo calls** at the bottom. Every call is listed: the tool, who it was for, the status, the result count, the time in ms, and the exact arguments sent.
-6. Choose **Dinner out**. If Qloo's candidates include a steakhouse or a satay place, Keeper sets it aside under "Keeper removed" and quotes the fact ("Arjun is vegetarian", "Mia is allergic to peanuts").
+6. Choose **Dinner out** with the location "Bandra, Mumbai". Arjun's Qloo calls ask for places with vegetarian options, and if a candidate is clearly meat-centric (a kebab or fried-chicken place) or a satay place, Keeper sets it aside under "Keeper removed" and quotes the fact ("Arjun is vegetarian", "Mia is allergic to peanuts").
 7. Tap a chip to leave someone out, for example only Mia and Dadi, and ask again.
 8. In the assistant box, type "What should we watch tonight?". The model calls the `taste_council` MCP tool, and **Under the hood** shows that `tools/call`.
 
@@ -45,11 +45,11 @@ flowchart TD
 ```
 
 1. **Facts become signals.** [server/taste/profile.ts](server/taste/profile.ts) reads household memory with plain rules. "Dadi loves Raj Kapoor films, Lata Mangeshkar and Mughal-e-Azam" gives three named loves. "Arjun likes thrillers" gives a tag. "Dadi is 74" gives the band `55+`. "Mia is allergic to peanuts" gives a constraint.
-2. **Candidates per person.** One `qloo_recommend` call per person, for the target type of the occasion (movie, tv_show, artist, book, or place).
+2. **Candidates per person.** One `qloo_recommend` call per person, for the target type of the occasion (movie, tv_show, artist, book, or place). Dinner asks for Qloo's restaurant genre, an outing for attractions such as parks and museums. A vegetarian's or vegan's dinner calls also carry Qloo's vegetarian or vegan options tag. When someone is under 18, films, shows, music and books rated for adults are left out, and the result says so.
 3. **One shared shortlist.** Round-robin across people, so everyone's candidates get in. At most 10 options, because `qloo_rank` accepts at most 10.
 4. **Rank the same list per person.** One `qloo_rank` call per person over that shortlist. Qloo says scores from separate calls are not comparable, so the council keeps only each person's order (1st, 2nd, ...).
 5. **Maximin.** The winner is the option whose worst rank across people is best. Ties go to the better mean rank. Nobody gets their 9th choice so that someone else gets their 1st.
-6. **Keeper.** Picks that clash with a diet, allergy, or "no horror" fact are removed, and the fact is quoted. Here Keeper is plain code, not the model agent of the same name in the household team.
+6. **Keeper.** Picks that clash with a diet, allergy, or "no horror" fact are removed, and the fact is quoted. Here Keeper is plain code (a keyword check), not the model agent of the same name in the household team.
 7. **Receipts.** The result carries every Qloo call. The Home page keeps the last few councils after a reload.
 
 The algorithm is in [server/taste/council.ts](server/taste/council.ts). The contract shared by server and page is [shared/taste.ts](shared/taste.ts).
@@ -60,13 +60,13 @@ The council talks to Qloo through Qloo's official harness, `qloo mcp` (package `
 
 | Tool | When | What we send | Why this tool |
 | --- | --- | --- | --- |
-| `qloo_recommend` | Once per person | `target_type`, `limit: 8`, the person's loves as `signals` (up to 4), likes as `signal_tags`, and, when a location is known, `signal_location` plus an age-band `demographic`. Places also get `filter_location`. | Turns each person's favourites into candidates of the right type, across domains: an artist can be the signal for films. |
-| `qloo_rank` | Once per person | The same `options` (Qloo entity ids from the shortlist), `option_type`, and that person's `signals`, `signal_location` and `demographic`. | Ranks one fixed list against one person's taste. Comparing positions across people is what makes the choice fair. |
+| `qloo_recommend` | Once per person | `target_type`, `limit: 8`, the person's loves as `signals` (up to 4), likes as `signal_tags`, and, when a location is known, `signal_location` plus an age-band `demographic`. Places also get `filter_location` and place tags (restaurant genre for dinner, plus a vegetarian or vegan options tag for that person's diet). | Turns each person's favourites into candidates of the right type, across domains: an artist can be the signal for films. |
+| `qloo_rank` | Once per person | The same `options` (Qloo entity ids from the shortlist), `option_type`, and that person's `signals`, `signal_location` and `demographic`. At dinner, a vegetarian or vegan person's diet tag as `include_tags`, so places without those options rank last for them. | Ranks one fixed list against one person's taste. Comparing positions across people is what makes the choice fair. |
 | `qloo_capabilities` | Before each council, and for the card's "ready" state | Nothing | Checks that `qloo mcp` started and has a credential. The harness answers it without contacting Qloo. |
 
 The harness offers nine workflow tools. The council uses the two that fit a group decision. `qloo_describe`, `qloo_entity_tags`, `qloo_find_tags`, `qloo_compare_audiences`, `qloo_audience_demographics`, `qloo_where_popular` and `qloo_trends` are not used yet.
 
-When Qloo cannot resolve a name, the harness returns `needs_input` with candidate matches. The council retries once with Qloo's first candidate id, and both calls show in the call list. Calls are cached for 30 minutes, and at most two are in flight at once. See [docs/QLOO.md](docs/QLOO.md).
+When Qloo cannot resolve a name, the harness returns `needs_input` with candidate matches. The council chooses one (a film or artist over an album of the same name), retries once with its Qloo id, and remembers it in `taste-entities.json`, so later calls send the id ([server/taste/entityMemo.ts](server/taste/entityMemo.ts)). With `AGORA_DEMO_SEED=1` the demo family starts out resolved. Calls are cached for 30 minutes and run one at a time by default (`AGORA_QLOO_IN_FLIGHT`, 1 to 4). A rate-limited (429) call is retried after 1.5 s and 4 s, within the council's 40-second deadline. A location such as "Bandra, Mumbai" filters places to Bandra and sends Mumbai as the audience location. See [docs/QLOO.md](docs/QLOO.md), which also has [live results](docs/QLOO.md#live-results) from the deployed demo.
 
 ## What is Qloo, what is code, what is Gemini
 
@@ -92,8 +92,8 @@ Take Qloo out and the council has nothing to rank with.
 
 ## Responsible use
 
-- **What goes to Qloo:** entity names as written in memory ("Encanto"), abstract likes as tags ("thrillers"), an age-band phrase ("seniors", "adults 35-44"), a location string, the target type, and the shortlist's Qloo entity ids. An "avoid" fact such as "no horror" is sent as an exclude tag for films, shows, music and books.
-- **What stays on the server:** first names, exact ages, allergies, diets, and the text of the facts. Names appear only in the local call log ("for Mia"). Keeper checks diets and allergies locally.
+- **What goes to Qloo:** entity names as written in memory ("Encanto"), abstract likes as tags ("thrillers"), an age-band phrase ("seniors", "adults 35-44"), a location string, the target type, and the shortlist's Qloo entity ids. An "avoid" fact such as "no horror" is sent as an exclude tag for films, shows, music and books. At dinner, a vegetarian or vegan diet is sent as Qloo's "vegetarian options" or "vegan options" place tag, with no name attached.
+- **What stays on the server:** first names, exact ages, allergies, other diets, and the text of the facts. Names appear only in the local call log ("for Mia"). Keeper checks diets and allergies locally.
 - **The key** is read by the `qloo mcp` child from `QLOO_API_KEY` or the harness's own config. Our code never logs it or returns it, and scrubs it from error text.
 - **Aggregate, not personal.** Qloo results are aggregate cultural affinities, not predictions about any one person. The card and the result sheet both say so.
 - **Nothing is booked or bought.** The council suggests. Adding a pick to the to-do list is a separate button.
@@ -105,18 +105,18 @@ What a council result does **not** establish:
 
 - That a person will enjoy the pick. "#2 of 10 for Dadi" means Qloo placed it second among those ten options for a profile built from Dadi's saved favourites.
 - That the pick is the best option anywhere. Ranks are only within a shortlist of at most 10.
-- That the pick is suitable for a child. There is no content-rating filter. The rating shows when Qloo returns one; a parent should check it.
-- That a place is safe for an allergy or a diet. Keeper is a keyword check on names, tags and descriptions, not a menu or ingredient check.
+- That the pick is suitable for a child. With someone under 18, only adult ratings (R, TV-MA, A, 18) and explicit titles are left out. Only an age band is known, so TV-14 and PG-13 still pass for a 9-year-old, and books have no rating. A parent should check.
+- That a place is safe for an allergy or a diet. Keeper is a keyword check on names, tags and descriptions, not a menu or ingredient check. The diet tag only says whether Qloo lists vegetarian or vegan options.
 - That "#2 for Mia" and "#2 for Dadi" mean the same strength of liking. Only order within one person's call is used.
 
 Other limits:
 
 - Under-18 maps to the phrase "teens", which Qloo's harness turns into its youngest age bucket (24 and younger). There is no "children" demographic, so a 9-year-old and a 16-year-old get the same age signal.
-- Age and location signals are sent only when a location is known (the request, or `AGORA_TASTE_LOCATION`).
+- Age and location signals are sent only when a location is known (the request, or `AGORA_TASTE_LOCATION`). Only the first comma part of a location filters places.
 - A person with only abstract likes ("street food") and no named favourite or location cannot be ranked. The result says so.
 - The fact parser is English pattern rules. Unusual phrasing is missed. `taste_profile` shows what it understood.
 - Maximin is one fairness rule. It can choose a pick everyone ranks third over one most people rank first.
-- When `needs_input` offers several matches, the council takes Qloo's first candidate. It can be the wrong "Coco".
+- When `needs_input` offers several matches, the council chooses one without asking and remembers it. It can be the wrong "Coco", and stays wrong until `taste-entities.json` is cleared.
 - One household per server.
 
 ## Run it yourself

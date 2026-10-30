@@ -27,12 +27,12 @@ In a multigenerational home, which is common in India and in many other places, 
 The Taste Council picks something a whole family will share, and shows why.
 
 1. It reads each person's taste from household memory: what they love, what they like, their age band, and their allergies, diets and "no horror" rules. Plain code does this, with no model.
-2. For each person it asks Qloo's `qloo_recommend` for candidates of the right type: films, shows, artists, books, or places.
+2. For each person it asks Qloo's `qloo_recommend` for candidates of the right type: films, shows, artists, books, or places. Dinner asks for restaurants, and for a vegetarian, restaurants Qloo lists with vegetarian options. With a child in the family, adult-rated films, shows, music and books are left out, and the result says so.
 3. It merges those into one shortlist of at most 10, taking turns between people so nobody's picks crowd out the others.
 4. For each person it asks Qloo's `qloo_rank` to put that same shortlist in order.
 5. It picks by maximin: the option whose worst rank across the family is best. Nobody gets their 9th choice so someone else can have their 1st.
-6. Keeper removes anything that clashes with a household fact, such as a steakhouse when Arjun is vegetarian, and quotes the fact.
-7. It speaks one sentence ("For movie night, B works for everyone: it ranks in the top 3 for Arjun, Dadi, Mia and Rohan.") and shows each person's rank, the runner-ups, and every Qloo call with its arguments, status and time.
+6. Keeper removes anything that clashes with a household fact, such as a kebab place when Arjun is vegetarian, and quotes the fact.
+7. It speaks one sentence ("For movie night, B works for everyone: it ranks in the top 3 for Arjun, Dadi, Mia and Rohan."), naming only the people Qloo actually ranked it for, and shows each person's rank, the runner-ups, and every Qloo call with its arguments, status and time.
 
 You can use it three ways: the **Ask the council** button on the Home page, the voice and text assistant on that page (Gemini on Vertex AI decides to call the council), or any MCP client such as Claude or ChatGPT through the `taste_council` tool.
 
@@ -42,13 +42,15 @@ Occasions: family movie night, a show to watch together, a road-trip playlist, a
 
 - **Qloo through its official harness.** The server starts `qloo mcp` from `@qloo/qloo-harness@0.1.26` as a child process and talks to it over MCP stdio. That is the route Qloo's hackathon kit recommends. The harness resolves names like "Encanto" to Qloo entities, and returns a normalised envelope with a status (`ok`, `needs_input`, `error`, ...).
 - **Three Qloo tools.** `qloo_recommend` for candidates per person, `qloo_rank` for each person's order of the shared shortlist, and `qloo_capabilities` to check readiness without calling Qloo.
-- **Signals from memory.** A person's named favourites become `signals`. Concepts like "thrillers" become `signal_tags`. An age band becomes a demographic phrase ("teens", "adults 35-44", "seniors"), sent with `signal_location` when a location is known. Places also get `filter_location`.
+- **Signals from memory.** A person's named favourites become `signals`. Concepts like "thrillers" become `signal_tags`. An age band becomes a demographic phrase ("teens", "adults 35-44", "seniors"), sent with `signal_location` when a location is known. Places also get `filter_location`: "Bandra, Mumbai" filters to Bandra and signals Mumbai. Dinner uses Qloo's restaurant genre; an outing uses place categories such as parks and museums, excluding restaurants. A vegetarian's or vegan's dinner calls carry Qloo's vegetarian or vegan options tag, so places without them rank last for that person.
+- **Names resolved once.** The harness answers `needs_input` for most names ("Coco" is a film and three albums). The council chooses a film or artist over an album, remembers the Qloo id in `taste-entities.json`, and sends the id from then on. The demo family starts out resolved.
 - **Deterministic decision.** The shortlist, maximin, tie-breaks, Keeper's vetoes and the spoken sentence are plain TypeScript. No model chooses the winner.
 - **Provenance in the UI.** Every Qloo call is recorded with tool, arguments, status, result count and milliseconds, and shown under "Qloo calls" on the result.
 - **MCP tools.** `taste_council` and `taste_profile` join the household server's other tools, so any MCP agent can call them. Streamable HTTP, OAuth, and approval-before-action were already there.
 - **Gemini on Vertex AI.** `AGORA_SERVER_LLM=vertex` runs the assistant's tool loop on Gemini (default `gemini-3.8-flash`, and `gemini-3.5-flash-lite` for spoken turns) through Vertex AI's OpenAI-compatible endpoint, authenticated with Application Default Credentials.
 - **Cloud Run.** One instance, the Qloo key from Secret Manager, the harness installed in the Docker image, and a fictional demo family written into empty memory at start-up.
-- **Tests.** The council is tested against a scripted stand-in for `qloo mcp`, so tests make no Qloo calls. The `server/taste` tests (65) pass, as do the MCP, Home page and Vertex provider tests.
+- **Tests.** The council is tested against a scripted stand-in for `qloo mcp`, so tests make no Qloo calls. The `server/taste` tests (92) pass, as do the MCP, Home page and Vertex provider tests.
+- **Live.** On the deployed demo (31 Oct 2026), each of the six occasions answered `ok` with 8 Qloo calls and no `needs_input`, in 1.5 to 3 seconds warm (18 seconds cold). The picks and ranks are in [QLOO.md](QLOO.md#live-results).
 
 ## Challenges we ran into
 
@@ -56,10 +58,10 @@ Occasions: family movie night, a show to watch together, a road-trip playlist, a
 - **Scores from separate calls are not comparable.** Qloo says so in the tool description. We use only each person's ordinal rank, which is also what makes maximin meaningful.
 - **A demographic needs a location.** Age signals are sent only when the request or `AGORA_TASTE_LOCATION` gives one. Without it the council still works, with no age signal.
 - **"Children" is not a recognised demographic.** We map age bands to phrases Qloo's harness understands: teens, young adults 18-24, adults 25-34 through 45-54, seniors. A 9-year-old is sent as "teens", which the harness maps to its youngest bucket (24 and younger).
-- **One unresolved entity fails the whole call.** If one of Dadi's favourites is ambiguous, the call returns `needs_input`. We retry once with Qloo's first suggested match in place of the ambiguous name, and show both calls.
+- **One unresolved entity fails the whole call.** If one of Dadi's favourites is ambiguous, the call returns `needs_input`. We choose a match by type (a film or artist over an album of the same name), retry once with its id, show both calls, and remember the id so the next council does not ask again.
 - **Gemini 3 thought signatures.** Gemini returns a signature on each function call and rejects the next request with HTTP 400 unless that signature comes back on the call. Our tool loop uses the Messages shape, which has no slot for it, so we carry it on the tool-use block and send it back. For older history with no signature we send Google's documented placeholder.
 - **Thinking budgets.** Gemini 3's thinking tokens count against `max_tokens`. The voice loop asked for 400 tokens and got empty answers. We set a 2048-token floor and a low reasoning effort. Flash rejects `minimal` with HTTP 400, so Flash gets `low` and Flash-Lite gets `minimal`.
-- **Quota.** A four-person council is eight Qloo calls. We cap calls at two in flight and cache results for 30 minutes.
+- **Quota.** A four-person council is eight Qloo calls, and the harness turns each call into several requests of its own. We run one call at a time by default, retry a 429 after 1.5 s and 4 s within a 40-second council deadline, and cache results for 30 minutes.
 
 ## Accomplishments that we're proud of
 
@@ -78,9 +80,9 @@ Occasions: family movie night, a show to watch together, a road-trip playlist, a
 
 ## What's next
 
-- Ask the person when `needs_input` offers several matches, instead of taking the first, and remember the answer.
+- Ask the person when `needs_input` offers several matches, instead of choosing for them.
 - Use more of Qloo's tools: `qloo_describe` and `qloo_entity_tags` to explain a pick in words the family uses, `qloo_find_tags` to turn "street food" into a Qloo tag before it is sent, and `qloo_compare_audiences` to show where two people's tastes overlap.
-- A content-rating filter when a child is in the council.
+- A finer age filter for children: today only adult ratings are left out, so TV-14 and PG-13 still pass for a 9-year-old.
 - Let the family weight the rule: maximin by default, with an option to favour the person whose turn it is.
 - Learn from outcomes: "we watched B and Dadi loved it" becomes a new memory fact and a new signal.
 
@@ -92,10 +94,10 @@ TypeScript, Node.js 22, React 19, Vite, Tailwind CSS 4, Qloo Insights API, Qloo 
 
 - Qloo results are aggregate cultural affinities, not predictions about a person. The app says so under every result.
 - What goes to Qloo: entity names, tags, an age-band phrase, a location, and Qloo entity ids. What stays local: names, exact ages, allergies, diets, and the fact text.
-- Keeper's allergy and diet check is a keyword check on Qloo's metadata, not a menu check.
+- Keeper's allergy and diet check is a keyword check on Qloo's metadata, not a menu check. The diet tag only says whether Qloo lists vegetarian or vegan options.
 - Nothing is booked or bought.
 - The demo family is fictional.
 
 ## Known limitations
 
-See [QLOO.md](QLOO.md#known-limitations). In short: a rank is a position in a shortlist of at most 10 for a profile built from a few favourites; there is no content-rating filter; Keeper is a keyword check; under-18s all get the same age signal; and ambiguity is resolved by taking Qloo's first match.
+See [QLOO.md](QLOO.md#known-limitations). In short: a rank is a position in a shortlist of at most 10 for a profile built from a few favourites; with a child, only adult ratings are left out, so TV-14 and PG-13 still pass and books have no rating; Keeper is a keyword check; under-18s all get the same age signal; only the first comma part of a location filters places; and an ambiguous name is chosen, not asked.
